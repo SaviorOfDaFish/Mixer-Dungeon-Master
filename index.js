@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import OpenAI from "openai";
 import {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   Client,
@@ -29,6 +30,15 @@ const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.6-terra";
+const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || "gpt-image-2";
+const OPENAI_IMAGE_QUALITY = ["low", "medium", "high"].includes(
+  String(process.env.OPENAI_IMAGE_QUALITY || "low").toLowerCase()
+)
+  ? String(process.env.OPENAI_IMAGE_QUALITY || "low").toLowerCase()
+  : "low";
+const AUTO_IMAGE_LIMIT = 3;
+const SCENE_COOLDOWN_MS = 10 * 60 * 1000;
+const PORTRAIT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN.");
 if (!DISCORD_CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID.");
@@ -602,6 +612,320 @@ function recentCampaignContext(campaign, limit = 20) {
 }
 
 // ============================================================
+// CINEMATIC IMAGE SYSTEM
+// ============================================================
+
+const imageCooldowns = new Map();
+
+function cooldownKey(type, guildId, userId) {
+  return `${type}:${guildId}:${userId}`;
+}
+
+function remainingCooldown(type, guildId, userId, durationMs) {
+  const last = imageCooldowns.get(cooldownKey(type, guildId, userId)) || 0;
+  return Math.max(0, durationMs - (Date.now() - last));
+}
+
+function markImageCooldown(type, guildId, userId) {
+  imageCooldowns.set(cooldownKey(type, guildId, userId), Date.now());
+}
+
+function formatCooldown(ms) {
+  const minutes = Math.ceil(ms / 60000);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.ceil(minutes / 60);
+  return `${hours} hour${hours === 1 ? "" : "s"}`;
+}
+
+function visualPartyContext(party) {
+  return party.memberIds
+    .map((userId) => {
+      const c = getCharacter(party.guildId, userId);
+      if (!c) return null;
+      return `${c.name}: ${c.ancestry} ${c.className}; appearance: ${c.appearance}; equipment: ${c.inventory.slice(0, 5).join(", ")}`;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function recentSceneText(campaign, limit = 8) {
+  return (campaign.log || [])
+    .filter((e) => e.type === "dm" || e.type === "player" || e.type === "roll")
+    .slice(-limit)
+    .map((e) => {
+      if (e.type === "dm") return `Dungeon Master: ${e.text}`;
+      if (e.type === "player") return `${e.characterName}: ${e.text}`;
+      if (e.type === "roll") {
+        return `${e.characterName} rolled ${e.checkName}: ${e.total} (${e.outcome})`;
+      }
+      return "";
+    })
+    .join("\n");
+}
+
+function cinematicPrompt(sceneDescription, party, extra = "") {
+  return `
+Create a cinematic fantasy tabletop RPG illustration for a D&D-style Discord campaign.
+
+VISUAL STYLE:
+- Highly detailed cinematic fantasy concept art.
+- Dramatic believable lighting, atmospheric depth, rich environmental storytelling.
+- Mature adventurous fantasy tone, not childish and not comedic unless the scene itself is comedic.
+- Wide cinematic composition unless specifically requested otherwise.
+- Keep recurring player characters faithful to the descriptions below.
+- Do not add captions, labels, logos, UI, borders, watermarks, stat blocks, dice, or readable text.
+- Do not invent extra party members.
+
+PARTY VISUAL REFERENCES:
+${visualPartyContext(party) || "No party visual references available."}
+
+CURRENT SCENE:
+${sceneDescription}
+
+${extra}
+`.trim();
+}
+
+async function generateImageBuffer(prompt, {
+  size = "1536x1024",
+  quality = OPENAI_IMAGE_QUALITY,
+} = {}) {
+  if (!openai) {
+    throw new Error("OpenAI is not configured.");
+  }
+
+  const result = await openai.images.generate({
+    model: OPENAI_IMAGE_MODEL,
+    prompt,
+    size,
+    quality,
+    output_format: "jpeg",
+    output_compression: 85,
+  });
+
+  const base64 = result.data?.[0]?.b64_json;
+  if (!base64) throw new Error("Image API returned no image data.");
+  return Buffer.from(base64, "base64");
+}
+
+function imageTypeLabel(type) {
+  return (
+    {
+      location: "Major Location",
+      npc: "Important NPC",
+      monster: "Creature Reveal",
+      discovery: "Major Discovery",
+      cinematic: "Cinematic Moment",
+    }[type] || "Cinematic Scene"
+  );
+}
+
+async function sendGeneratedImage(channel, {
+  title = "Cinematic Scene",
+  prompt,
+  filename = "campaign-scene.jpg",
+  size = "1536x1024",
+  quality = OPENAI_IMAGE_QUALITY,
+}) {
+  const buffer = await generateImageBuffer(prompt, { size, quality });
+  const attachment = new AttachmentBuilder(buffer, { name: filename });
+
+  await channel.send({
+    content: `🖼️ **${title}**`,
+    files: [attachment],
+  });
+}
+
+async function maybeSendAutomaticImage(channel, campaign, party, imageData) {
+  if (!imageData || imageData.image_type === "none" || !imageData.image_prompt) {
+    return false;
+  }
+
+  campaign.autoImagesUsed ||= 0;
+  if (campaign.autoImagesUsed >= AUTO_IMAGE_LIMIT) return false;
+
+  // Reserve the slot immediately to prevent simultaneous messages from creating
+  // more than the campaign limit. Give it back if generation fails.
+  campaign.autoImagesUsed += 1;
+  saveDataSoon();
+
+  try {
+    const prompt = cinematicPrompt(
+      imageData.image_prompt,
+      party,
+      "This image represents an important reveal chosen by the Dungeon Master."
+    );
+
+    await sendGeneratedImage(channel, {
+      title: imageTypeLabel(imageData.image_type),
+      prompt,
+      filename: `campaign-${campaign.id}-${campaign.autoImagesUsed}.jpg`,
+      size: "1536x1024",
+    });
+
+    appendLog(campaign, {
+      type: "system",
+      text: `A cinematic image was generated for: ${imageTypeLabel(imageData.image_type)}.`,
+    });
+    return true;
+  } catch (err) {
+    campaign.autoImagesUsed = Math.max(0, (campaign.autoImagesUsed || 1) - 1);
+    saveDataSoon();
+    console.error("Automatic image generation error:", err);
+    await channel.send(
+      "⚠️ **The cinematic image couldn't be generated.** The story can continue normally; no automatic image slot was consumed."
+    );
+    return false;
+  }
+}
+
+async function handleSceneCommand(interaction) {
+  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  if (!party) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "You need to be in a party before using `/scene`.",
+    });
+  }
+
+  const campaign =
+    getActiveCampaignForChannel(interaction.guildId, interaction.channelId) ||
+    getCampaignForParty(party.id);
+
+  if (!campaign || campaign.status !== "active") {
+    return interaction.reply({
+      ephemeral: true,
+      content: "Your party needs an active adventure before using `/scene`.",
+    });
+  }
+
+  if (campaign.partyId !== party.id) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "This channel belongs to a different active party.",
+    });
+  }
+
+  const remaining = remainingCooldown(
+    "scene",
+    interaction.guildId,
+    campaign.id,
+    SCENE_COOLDOWN_MS
+  );
+
+  if (remaining > 0) {
+    return interaction.reply({
+      ephemeral: true,
+      content: `🖼️ Your party's **/scene** is on cooldown for another **${formatCooldown(remaining)}**.`,
+    });
+  }
+
+  await interaction.deferReply();
+  markImageCooldown("scene", interaction.guildId, campaign.id);
+
+  try {
+    const scene = recentSceneText(campaign, 10) || campaign.summary;
+    const prompt = cinematicPrompt(
+      scene,
+      party,
+      "Illustrate the party's CURRENT moment only. Focus on the location, atmosphere, visible NPCs/creatures, and what is happening right now."
+    );
+    const buffer = await generateImageBuffer(prompt, {
+      size: "1536x1024",
+    });
+
+    const attachment = new AttachmentBuilder(buffer, {
+      name: `scene-${campaign.id}.jpg`,
+    });
+
+    await interaction.editReply({
+      content: `🖼️ **Current Scene — ${campaign.title}**`,
+      files: [attachment],
+    });
+  } catch (err) {
+    // Give the cooldown back when the API itself fails.
+    imageCooldowns.delete(cooldownKey("scene", interaction.guildId, campaign.id));
+    console.error("/scene image error:", err);
+    await interaction.editReply(
+      "❌ I couldn't generate the scene image. Check the Railway logs. Your `/scene` cooldown was not consumed."
+    );
+  }
+}
+
+async function handlePortraitCommand(interaction) {
+  const character = getCharacter(interaction.guildId, interaction.user.id);
+
+  if (!character) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "Create a character first with `/createcharacter`.",
+    });
+  }
+
+  const remaining = remainingCooldown(
+    "portrait",
+    interaction.guildId,
+    interaction.user.id,
+    PORTRAIT_COOLDOWN_MS
+  );
+
+  if (remaining > 0) {
+    return interaction.reply({
+      ephemeral: true,
+      content: `🎨 **/portrait** is on cooldown for another **${formatCooldown(remaining)}**.`,
+    });
+  }
+
+  await interaction.deferReply();
+  markImageCooldown("portrait", interaction.guildId, interaction.user.id);
+
+  try {
+    const classInfo = CLASS_DATA[character.className];
+    const prompt = `
+Create a highly detailed cinematic fantasy character portrait for a tabletop RPG adventurer.
+
+CHARACTER:
+Name: ${character.name}
+Ancestry: ${character.ancestry}
+Class: ${character.className}
+Background: ${character.background}
+Appearance: ${character.appearance}
+Equipment: ${character.inventory.join(", ")}
+Personality quirk: ${character.quirk}
+
+ART DIRECTION:
+- Full-body or three-quarter heroic fantasy portrait.
+- Faithfully follow the supplied physical appearance.
+- Show class-appropriate clothing and the listed signature equipment.
+- Dramatic fantasy lighting and believable materials.
+- Neutral atmospheric fantasy background that does not overpower the character.
+- No text, card frame, UI, logo, watermark, labels, or stat blocks.
+- Do not visually reveal the character's private secret.
+${classInfo?.emoji ? "" : ""}
+`.trim();
+
+    const buffer = await generateImageBuffer(prompt, {
+      size: "1024x1536",
+    });
+
+    const attachment = new AttachmentBuilder(buffer, {
+      name: `${character.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-portrait.jpg`,
+    });
+
+    await interaction.editReply({
+      content: `🎨 **${character.name} — Character Portrait**`,
+      files: [attachment],
+    });
+  } catch (err) {
+    imageCooldowns.delete(cooldownKey("portrait", interaction.guildId, interaction.user.id));
+    console.error("/portrait image error:", err);
+    await interaction.editReply(
+      "❌ I couldn't generate the character portrait. Check the Railway logs. Your `/portrait` cooldown was not consumed."
+    );
+  }
+}
+
+// ============================================================
 // AI DM
 // ============================================================
 
@@ -633,6 +957,12 @@ RULES:
 - Never reveal a character's private secret unless story events have actually exposed it.
 - Weave player goals, fears, quirks, backgrounds, and secrets into the campaign gradually.
 - Keep content appropriate for a general Discord gaming server.
+
+CINEMATIC IMAGE RULES:
+- Most DM responses MUST use image_type "none".
+- Request an automatic image only for a truly memorable visual beat: a major new location reveal, first reveal of an important NPC, boss or major monster reveal, major discovery, or chapter-scale cinematic moment.
+- Do not request images for ordinary conversation, routine exploration, normal attacks, small loot, skill checks, or every new room.
+- When requesting an image, image_prompt must describe only what should visibly appear. Preserve known character/NPC traits and avoid readable text.
 `;
 
 const dmActionSchema = {
@@ -683,6 +1013,11 @@ const dmActionSchema = {
     roll_reason: { type: "string" },
     consequences_success: { type: "string" },
     consequences_failure: { type: "string" },
+    image_type: {
+      type: "string",
+      enum: ["none", "location", "npc", "monster", "discovery", "cinematic"],
+    },
+    image_prompt: { type: "string" },
   },
   required: [
     "narration",
@@ -694,6 +1029,8 @@ const dmActionSchema = {
     "roll_reason",
     "consequences_success",
     "consequences_failure",
+    "image_type",
+    "image_prompt",
   ],
 };
 
@@ -710,6 +1047,8 @@ async function aiDMAction(campaign, party, actingUserId, playerText) {
       roll_reason: "",
       consequences_success: "",
       consequences_failure: "",
+      image_type: "none",
+      image_prompt: "",
     };
   }
 
@@ -756,12 +1095,28 @@ async function aiDMAction(campaign, party, actingUserId, playerText) {
   return JSON.parse(response.output_text);
 }
 
+const narrationImageSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    narration: { type: "string" },
+    image_type: {
+      type: "string",
+      enum: ["none", "location", "npc", "monster", "discovery", "cinematic"],
+    },
+    image_prompt: { type: "string" },
+  },
+  required: ["narration", "image_type", "image_prompt"],
+};
+
 async function aiOpening(campaign, party) {
   if (!openai) {
-    return (
-      "⚠️ The campaign has been created, but the AI Dungeon Master is not configured. " +
-      "Add `OPENAI_API_KEY` to Railway and restart the bot."
-    );
+    return {
+      narration:
+        "⚠️ The campaign has been created, but the AI Dungeon Master is not configured. Add `OPENAI_API_KEY` to Railway and restart the bot.",
+      image_type: "none",
+      image_prompt: "",
+    };
   }
 
   const input = JSON.stringify(
@@ -769,7 +1124,7 @@ async function aiOpening(campaign, party) {
       mode: campaign.mode,
       party: partyMembersContext(party),
       request:
-        "Create the opening scene for a brand-new fantasy adventure. Give the party an immediate situation, mystery, danger, or intriguing NPC. Do not request a dice roll yet. End by asking what the party does.",
+        "Create the opening scene for a brand-new fantasy adventure. Give the party an immediate situation, mystery, danger, or intriguing NPC. Do not request a dice roll yet. End by asking what the party does. Because this is a chapter-opening cinematic, you MAY request one image if the scene has a strong visual identity.",
     },
     null,
     2
@@ -777,17 +1132,29 @@ async function aiOpening(campaign, party) {
 
   const response = await openai.responses.create({
     model: OPENAI_MODEL,
-    instructions:
-      DM_INSTRUCTIONS +
-      "\nFor this response only, return normal Discord-ready narration, not JSON.",
+    instructions: DM_INSTRUCTIONS,
     input,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "campaign_opening",
+        strict: true,
+        schema: narrationImageSchema,
+      },
+    },
   });
 
-  return response.output_text.trim();
+  return JSON.parse(response.output_text);
 }
 
 async function aiResume(campaign, party) {
-  if (!openai) return "⚠️ Add `OPENAI_API_KEY` before continuing the campaign.";
+  if (!openai) {
+    return {
+      narration: "⚠️ Add `OPENAI_API_KEY` before continuing the campaign.",
+      image_type: "none",
+      image_prompt: "",
+    };
+  }
 
   const input = JSON.stringify(
     {
@@ -800,7 +1167,7 @@ async function aiResume(campaign, party) {
       party: partyMembersContext(party),
       recentHistory: recentCampaignContext(campaign, 30),
       request:
-        "Give a short Previously On recap, then re-establish the current scene and ask what the party does. Do not request a roll yet.",
+        "Give a short Previously On recap, then re-establish the current scene and ask what the party does. Do not request a roll yet. Usually use image_type none; only request an image if resuming at a major cinematic reveal.",
     },
     null,
     2
@@ -808,20 +1175,31 @@ async function aiResume(campaign, party) {
 
   const response = await openai.responses.create({
     model: OPENAI_MODEL,
-    instructions:
-      DM_INSTRUCTIONS +
-      "\nFor this response only, return normal Discord-ready narration, not JSON.",
+    instructions: DM_INSTRUCTIONS,
     input,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "campaign_resume",
+        strict: true,
+        schema: narrationImageSchema,
+      },
+    },
   });
 
-  return response.output_text.trim();
+  return JSON.parse(response.output_text);
 }
 
 async function aiResolveCheck(campaign, party, rollRecord, pending) {
   if (!openai) {
-    return rollRecord.outcome === "SUCCESS"
-      ? "The attempt succeeds."
-      : "The attempt fails, and the situation becomes more complicated.";
+    return {
+      narration:
+        rollRecord.outcome === "SUCCESS"
+          ? "The attempt succeeds."
+          : "The attempt fails, and the situation becomes more complicated.",
+      image_type: "none",
+      image_prompt: "",
+    };
   }
 
   const input = JSON.stringify(
@@ -846,7 +1224,7 @@ async function aiResolveCheck(campaign, party, rollRecord, pending) {
         failureDirection: pending.failureDirection,
       },
       request:
-        "Narrate the resolved result. Respect the exact success/failure outcome. Do not request another check in this response. Advance the fiction and give the party something to respond to.",
+        "Narrate the resolved result. Respect the exact success/failure outcome. Do not request another check in this response. Advance the fiction and give the party something to respond to. Only request an image if this resolved check causes a genuinely major reveal.",
     },
     null,
     2
@@ -854,13 +1232,19 @@ async function aiResolveCheck(campaign, party, rollRecord, pending) {
 
   const response = await openai.responses.create({
     model: OPENAI_MODEL,
-    instructions:
-      DM_INSTRUCTIONS +
-      "\nFor this response only, return normal Discord-ready narration, not JSON.",
+    instructions: DM_INSTRUCTIONS,
     input,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "resolved_check_narration",
+        strict: true,
+        schema: narrationImageSchema,
+      },
+    },
   });
 
-  return response.output_text.trim();
+  return JSON.parse(response.output_text);
 }
 
 async function aiCharacterStory(draft) {
@@ -1471,6 +1855,7 @@ async function handleAdventureCommand(interaction) {
       location: "Unknown",
       summary: "The adventure has just begun.",
       pendingChecks: {},
+      autoImagesUsed: 0,
       log: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -1483,14 +1868,21 @@ async function handleAdventureCommand(interaction) {
 
     try {
       const opening = await aiOpening(campaign, party);
-      appendLog(campaign, { type: "dm", text: opening });
+      appendLog(campaign, { type: "dm", text: opening.narration });
 
       await interaction.editReply({
         content:
           `# 🎲 ${modeLabel(mode)} Begins!\n` +
           `**Party:** ${party.name}\n\n` +
-          `${opening}`,
+          `${opening.narration}`,
       });
+
+      await maybeSendAutomaticImage(
+        interaction.channel,
+        campaign,
+        party,
+        opening
+      );
     } catch (err) {
       console.error("Adventure opening error:", err);
       await interaction.editReply(
@@ -1517,11 +1909,19 @@ async function handleAdventureCommand(interaction) {
     await interaction.deferReply();
 
     try {
-      const text = await aiResume(campaign, party);
-      appendLog(campaign, { type: "dm", text });
-      return interaction.editReply({
-        content: `# 📖 Previously On...\n\n${text}`,
+      const resumed = await aiResume(campaign, party);
+      appendLog(campaign, { type: "dm", text: resumed.narration });
+      await interaction.editReply({
+        content: `# 📖 Previously On...\n\n${resumed.narration}`,
       });
+
+      await maybeSendAutomaticImage(
+        interaction.channel,
+        campaign,
+        party,
+        resumed
+      );
+      return;
     } catch (err) {
       console.error("Adventure continue error:", err);
       return interaction.editReply("❌ The AI DM couldn't continue the adventure.");
@@ -1566,6 +1966,11 @@ async function handleAdventureCommand(interaction) {
         { name: "Status", value: campaign.status, inline: true },
         { name: "Chapter", value: `${campaign.chapter}`, inline: true },
         { name: "Pending Rolls", value: `${pendingCount}`, inline: true },
+        {
+          name: "Cinematic Images",
+          value: `${campaign.autoImagesUsed || 0}/${AUTO_IMAGE_LIMIT} automatic`,
+          inline: true,
+        },
         { name: "Location", value: campaign.location || "Unknown" },
         { name: "Summary", value: truncate(campaign.summary, 1000) }
       );
@@ -1606,6 +2011,13 @@ async function processPlayerAction(message, campaign, party) {
 
     appendLog(campaign, { type: "dm", text: result.narration });
     await sendLong(message.channel, `🎭 **Dungeon Master**\n\n${result.narration}`);
+
+    await maybeSendAutomaticImage(
+      message.channel,
+      campaign,
+      party,
+      result
+    );
 
     if (
       result.action_type === "check" &&
@@ -1790,9 +2202,19 @@ async function handleRollCommand(interaction) {
   });
 
   try {
-    const narration = await aiResolveCheck(campaign, party, rollRecord, pending);
-    appendLog(campaign, { type: "dm", text: narration });
-    await sendLong(interaction.channel, `🎭 **Dungeon Master**\n\n${narration}`);
+    const resolved = await aiResolveCheck(campaign, party, rollRecord, pending);
+    appendLog(campaign, { type: "dm", text: resolved.narration });
+    await sendLong(
+      interaction.channel,
+      `🎭 **Dungeon Master**\n\n${resolved.narration}`
+    );
+
+    await maybeSendAutomaticImage(
+      interaction.channel,
+      campaign,
+      party,
+      resolved
+    );
   } catch (err) {
     console.error("Resolve-check narration error:", err);
     await interaction.followUp(
@@ -1944,6 +2366,14 @@ const commands = [
     .setDescription("View recent events from your party's campaign."),
 
   new SlashCommandBuilder()
+    .setName("scene")
+    .setDescription("Generate a cinematic image of the current campaign scene."),
+
+  new SlashCommandBuilder()
+    .setName("portrait")
+    .setDescription("Generate a cinematic portrait of your saved character."),
+
+  new SlashCommandBuilder()
     .setName("dndhelp")
     .setDescription("Show the D&D bot quick-start guide."),
 ].map((c) => c.toJSON());
@@ -2028,6 +2458,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "recap":
           return handleRecap(interaction);
 
+        case "scene":
+          return handleSceneCommand(interaction);
+
+        case "portrait":
+          return handlePortraitCommand(interaction);
+
         case "dndhelp":
           return interaction.reply({
             ephemeral: true,
@@ -2041,8 +2477,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   "**4.** Party leader uses `/adventure start`.\n" +
                   "**5.** Talk normally in the adventure channel to tell the DM what your character does.\n" +
                   "**6.** When the DM requests a check, use `/roll`.\n" +
-                  "**7.** `/character`, `/inventory`, `/recap`, and `/adventure status` show saved information.\n\n" +
-                  "🎲 You can also roll manual dice with `/roll dice:2d6+3`."
+                  "**7.** `/character`, `/inventory`, `/recap`, and `/adventure status` show saved information.\n" +
+                  "**8.** `/scene` generates the current cinematic scene and `/portrait` creates your character art.\n\n" +
+                  "🎲 You can also roll manual dice with `/roll dice:2d6+3`.\n" +
+                  `🖼️ Automatic cinematic images are limited to ${AUTO_IMAGE_LIMIT} per campaign.`
                 ),
             ],
           });
@@ -2116,6 +2554,8 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
   console.log(`Data file: ${DATA_FILE}`);
   console.log(`OpenAI model: ${OPENAI_MODEL}`);
+  console.log(`OpenAI image model: ${OPENAI_IMAGE_MODEL}`);
+  console.log(`Image quality: ${OPENAI_IMAGE_QUALITY}`);
   console.log(`AI configured: ${openai ? "YES" : "NO"}`);
 });
 
