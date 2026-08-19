@@ -401,6 +401,37 @@ function getCampaignForParty(partyId) {
     .sort((a, b) => b.updatedAt - a.updatedAt)[0] || null;
 }
 
+// Find the exact pending roll for a player. We prefer the active campaign in
+// the channel where /roll was used, then fall back to any active/saved
+// campaign for that party that is actually holding that player's pending
+// check. This prevents an older/newer duplicate campaign from stealing /roll.
+function findPendingCheckCampaign(guildId, channelId, partyId, userId) {
+  const candidates = Object.values(data.campaigns)
+    .filter(
+      (c) =>
+        c.guildId === guildId &&
+        c.partyId === partyId &&
+        c.status !== "ended" &&
+        c.pendingChecks?.[userId]
+    )
+    .sort((a, b) => {
+      const aSameChannel = a.channelId === channelId ? 1 : 0;
+      const bSameChannel = b.channelId === channelId ? 1 : 0;
+      if (aSameChannel !== bSameChannel) return bSameChannel - aSameChannel;
+
+      const aActive = a.status === "active" ? 1 : 0;
+      const bActive = b.status === "active" ? 1 : 0;
+      if (aActive !== bActive) return bActive - aActive;
+
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
+
+  const campaign = candidates[0] || null;
+  return campaign
+    ? { campaign, pending: campaign.pendingChecks[userId] }
+    : { campaign: null, pending: null };
+}
+
 function appendLog(campaign, entry) {
   campaign.log ||= [];
   campaign.log.push({
@@ -1591,10 +1622,12 @@ async function processPlayerAction(message, campaign, party) {
         id: uid(),
         checkName: result.check_name,
         ability,
+        dice: "1d20",
         dc: clamp(result.dc, 5, 30),
         reason: result.roll_reason,
         successDirection: result.consequences_success,
         failureDirection: result.consequences_failure,
+        channelId: message.channelId,
         createdAt: Date.now(),
       };
 
@@ -1610,12 +1643,19 @@ async function processPlayerAction(message, campaign, party) {
             inline: true,
           },
           {
+            name: "Die to Roll",
+            value: "🎲 **1d20**",
+            inline: true,
+          },
+          {
             name: "Modifier",
             value: `${ability} ${formatModifier(character.stats[ability] || 0)}`,
             inline: true,
           }
         )
-        .setFooter({ text: "Use /roll to resolve it. The DC is hidden." });
+        .setFooter({
+          text: "Use /roll — the bot will automatically roll the required 1d20. The DC is hidden.",
+        });
 
       await message.channel.send({ embeds: [checkEmbed] });
     }
@@ -1645,14 +1685,29 @@ async function handleRollCommand(interaction) {
 
   const customDice = interaction.options.getString("dice");
   const party = getPartyByMember(guildId, userId);
-  const campaign = party ? getCampaignForParty(party.id) : null;
-  const pending =
-    campaign?.status === "active"
-      ? campaign.pendingChecks?.[userId]
-      : null;
 
-  // Generic/manual dice roll
-  if (customDice || !pending) {
+  // IMPORTANT: locate the campaign that ACTUALLY owns this player's pending
+  // check instead of simply grabbing the most recently updated campaign.
+  const pendingLookup = party
+    ? findPendingCheckCampaign(guildId, interaction.channelId, party.id, userId)
+    : { campaign: null, pending: null };
+
+  const campaign = pendingLookup.campaign;
+  const pending = pendingLookup.pending;
+
+  // If the DM is waiting on a check, don't let a custom/manual dice expression
+  // accidentally bypass it. /roll with no dice resolves the requested check.
+  if (pending && customDice) {
+    return interaction.reply({
+      ephemeral: true,
+      content:
+        `🎲 **${character.name} already has a ${pending.checkName.replace(/([a-z])([A-Z])/g, "$1 $2")} check waiting.**\n` +
+        `The required roll is **${pending.dice || "1d20"}**. Use \`/roll\` with no dice entered and the bot will roll it automatically.`,
+    });
+  }
+
+  // No pending DM check = generic/manual dice roller.
+  if (!pending) {
     const expression = customDice || "d20";
     const rolled = rollDice(expression);
 
@@ -1676,11 +1731,27 @@ async function handleRollCommand(interaction) {
     });
   }
 
+  // Pending DM checks specify their own die. Ability/skill/attack checks are
+  // currently 1d20, but storing the expression makes this ready for other
+  // requested roll types later.
+  const diceExpression = pending.dice || "1d20";
+  const rolled = rollDice(diceExpression);
+
+  if (!rolled) {
+    console.error("Invalid pending dice expression:", pending);
+    return interaction.reply({
+      ephemeral: true,
+      content:
+        "⚠️ The DM requested a roll, but its dice information is invalid. Your roll was **not** consumed.",
+    });
+  }
+
   const modifier = character.stats[pending.ability] || 0;
-  const naturalRoll = rollDie(20);
-  const total = naturalRoll + modifier;
+  const naturalRoll = rolled.rolls[0];
+  const total = rolled.raw + modifier;
   const outcome = total >= pending.dc ? "SUCCESS" : "FAILURE";
 
+  // Only consume the pending check AFTER we have a valid roll.
   delete campaign.pendingChecks[userId];
 
   const rollRecord = {
@@ -1689,6 +1760,7 @@ async function handleRollCommand(interaction) {
     characterName: character.name,
     checkName: pending.checkName,
     ability: pending.ability,
+    dice: diceExpression,
     naturalRoll,
     modifier,
     total,
@@ -1699,9 +1771,9 @@ async function handleRollCommand(interaction) {
   saveDataSoon();
 
   const natText =
-    naturalRoll === 20
+    diceExpression === "1d20" && naturalRoll === 20
       ? "\n🌟 **NATURAL 20!**"
-      : naturalRoll === 1
+      : diceExpression === "1d20" && naturalRoll === 1
         ? "\n💀 **NATURAL 1!**"
         : "";
 
@@ -1710,6 +1782,7 @@ async function handleRollCommand(interaction) {
   await interaction.reply({
     content:
       `🎲 **${character.name} — ${pending.checkName.replace(/([a-z])([A-Z])/g, "$1 $2")}**\n` +
+      `Required Die: **${diceExpression}**\n` +
       `Natural Roll: **${naturalRoll}**\n` +
       `${pending.ability}: **${formatModifier(modifier)}**\n` +
       `Total: **${total}**${natText}\n\n` +
