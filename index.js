@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import OpenAI from "openai";
+import express from "express";
 import {
   ActionRowBuilder,
   AttachmentBuilder,
@@ -39,6 +40,8 @@ const OPENAI_IMAGE_QUALITY = ["low", "medium", "high"].includes(
 const AUTO_IMAGE_LIMIT = 3;
 const SCENE_COOLDOWN_MS = 10 * 60 * 1000;
 const PORTRAIT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const DICE_BRIDGE_SECRET = process.env.DICE_BRIDGE_SECRET || "";
+const HTTP_PORT = Number(process.env.PORT || 3000);
 
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN.");
 if (!DISCORD_CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID.");
@@ -2066,10 +2069,13 @@ async function processPlayerAction(message, campaign, party) {
           }
         )
         .setFooter({
-          text: "Use /roll — the bot will automatically roll the required 1d20. The DC is hidden.",
+          text: "Use the 3D Dice button below, or /roll as a fallback. The DC is hidden.",
         });
 
-      await message.channel.send({ embeds: [checkEmbed] });
+      await message.channel.send({
+        embeds: [checkEmbed],
+        components: [make3DDiceButton(campaign.pendingChecks[message.author.id])],
+      });
     }
   } catch (err) {
     console.error("AI DM action error:", err);
@@ -2487,6 +2493,39 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
+    if (
+      interaction.isButton() &&
+      interaction.customId.startsWith("launch_3d_dice:")
+    ) {
+      const pendingId = interaction.customId.split(":")[1];
+      const party = getPartyByMember(interaction.guildId, interaction.user.id);
+
+      if (!party) {
+        return interaction.reply({
+          ephemeral: true,
+          content: "You're not currently in an adventuring party.",
+        });
+      }
+
+      const found = findPendingCheckCampaign(
+        interaction.guildId,
+        interaction.channelId,
+        party.id,
+        interaction.user.id
+      );
+
+      if (!found.pending || found.pending.id !== pendingId) {
+        return interaction.reply({
+          ephemeral: true,
+          content:
+            "⚠️ That roll is no longer pending. If the DM just requested a new roll, use the newest 3D Dice button.",
+        });
+      }
+
+      // Discord.js uses the official LAUNCH_ACTIVITY interaction callback.
+      return interaction.launchActivity();
+    }
+
     if (interaction.isModalSubmit() && interaction.customId.startsWith("cc_details:")) {
       return handleCharacterDetails(interaction);
     }
@@ -2515,6 +2554,247 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error("Could not send interaction error reply:", replyErr);
     }
   }
+});
+
+// ============================================================
+// 3D DICE ACTIVITY BRIDGE
+// ============================================================
+
+function make3DDiceButton(pending) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`launch_3d_dice:${pending.id}`)
+      .setLabel(`Roll ${String(pending.dice || "1d20").toUpperCase()} in 3D`)
+      .setEmoji("🎲")
+      .setStyle(ButtonStyle.Primary)
+  );
+}
+
+function bridgeAuthorized(req) {
+  if (!DICE_BRIDGE_SECRET) return false;
+  const supplied = String(req.headers["x-dice-bridge-secret"] || "");
+  return supplied.length > 0 && supplied === DICE_BRIDGE_SECRET;
+}
+
+function findBridgePending(guildId, channelId, userId) {
+  const character = getCharacter(guildId, userId);
+  if (!character) return { error: "NO_CHARACTER" };
+
+  const party = getPartyByMember(guildId, userId);
+  if (!party) return { error: "NO_PARTY" };
+
+  const found = findPendingCheckCampaign(
+    guildId,
+    channelId,
+    party.id,
+    userId
+  );
+
+  if (!found.campaign || !found.pending) {
+    return { error: "NO_PENDING_ROLL" };
+  }
+
+  if (found.campaign.channelId !== channelId) {
+    return { error: "WRONG_CHANNEL" };
+  }
+
+  return {
+    character,
+    party,
+    campaign: found.campaign,
+    pending: found.pending,
+  };
+}
+
+async function resolvePhysicalD20({
+  guildId,
+  channelId,
+  userId,
+  naturalRoll,
+}) {
+  const found = findBridgePending(guildId, channelId, userId);
+
+  if (found.error) {
+    return { ok: false, error: found.error };
+  }
+
+  const { character, party, campaign, pending } = found;
+
+  if ((pending.dice || "1d20") !== "1d20") {
+    return { ok: false, error: "UNSUPPORTED_DIE" };
+  }
+
+  if (!Number.isInteger(naturalRoll) || naturalRoll < 1 || naturalRoll > 20) {
+    return { ok: false, error: "INVALID_RESULT" };
+  }
+
+  // Consume before AI narration so a duplicate HTTP request cannot resolve twice.
+  delete campaign.pendingChecks[userId];
+
+  const modifier = character.stats[pending.ability] || 0;
+  const total = naturalRoll + modifier;
+  const outcome = total >= pending.dc ? "SUCCESS" : "FAILURE";
+
+  const rollRecord = {
+    type: "roll",
+    source: "3d_activity",
+    userId,
+    characterName: character.name,
+    checkName: pending.checkName,
+    ability: pending.ability,
+    dice: pending.dice || "1d20",
+    naturalRoll,
+    modifier,
+    total,
+    outcome,
+  };
+
+  appendLog(campaign, rollRecord);
+  saveDataSoon();
+
+  const channel = await client.channels.fetch(channelId);
+  if (!channel?.isTextBased()) {
+    return { ok: false, error: "CHANNEL_UNAVAILABLE" };
+  }
+
+  const natText =
+    naturalRoll === 20
+      ? "\n🌟 **NATURAL 20!**"
+      : naturalRoll === 1
+        ? "\n💀 **NATURAL 1!**"
+        : "";
+
+  const resultEmoji = outcome === "SUCCESS" ? "✅" : "❌";
+
+  await channel.send({
+    content:
+      `🎲 **${character.name} — ${pending.checkName.replace(/([a-z])([A-Z])/g, "$1 $2")}**\n` +
+      `3D Physical Roll: **${naturalRoll}**\n` +
+      `${pending.ability}: **${formatModifier(modifier)}**\n` +
+      `Total: **${total}**${natText}\n\n` +
+      `${resultEmoji} **${outcome}**`,
+    allowedMentions: { parse: [] },
+  });
+
+  try {
+    const resolved = await aiResolveCheck(campaign, party, rollRecord, pending);
+    appendLog(campaign, { type: "dm", text: resolved.narration });
+
+    await sendLong(
+      channel,
+      `🎭 **Dungeon Master**\n\n${resolved.narration}`
+    );
+
+    await maybeSendAutomaticImage(
+      channel,
+      campaign,
+      party,
+      resolved
+    );
+  } catch (err) {
+    console.error("3D roll narration error:", err);
+    await channel.send(
+      "⚠️ The 3D roll was saved correctly, but the Dungeon Master's follow-up narration failed."
+    );
+  }
+
+  return {
+    ok: true,
+    naturalRoll,
+    modifier,
+    total,
+    outcome,
+    characterName: character.name,
+    checkName: pending.checkName,
+  };
+}
+
+// Railway HTTP API used ONLY by the Dice Activity backend.
+// The shared secret never appears in browser/client JavaScript.
+const bridgeApp = express();
+bridgeApp.use(express.json({ limit: "32kb" }));
+
+bridgeApp.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "mixer-dungeon-master",
+    diceBridgeConfigured: Boolean(DICE_BRIDGE_SECRET),
+  });
+});
+
+bridgeApp.post("/dice/pending", (req, res) => {
+  if (!bridgeAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+  }
+
+  const { guildId, channelId, userId } = req.body || {};
+
+  if (!guildId || !channelId || !userId) {
+    return res.status(400).json({ ok: false, error: "MISSING_FIELDS" });
+  }
+
+  const found = findBridgePending(
+    String(guildId),
+    String(channelId),
+    String(userId)
+  );
+
+  if (found.error) {
+    return res.status(404).json({ ok: false, error: found.error });
+  }
+
+  const { character, pending } = found;
+
+  return res.json({
+    ok: true,
+    pending: {
+      id: pending.id,
+      characterName: character.name,
+      checkName: pending.checkName,
+      dice: pending.dice || "1d20",
+      ability: pending.ability,
+      modifier: character.stats[pending.ability] || 0,
+      reason: pending.reason || "",
+    },
+  });
+});
+
+bridgeApp.post("/dice/result", async (req, res) => {
+  if (!bridgeAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+  }
+
+  const { guildId, channelId, userId, die, result } = req.body || {};
+
+  if (!guildId || !channelId || !userId) {
+    return res.status(400).json({ ok: false, error: "MISSING_FIELDS" });
+  }
+
+  if (String(die || "").toLowerCase() !== "d20") {
+    return res.status(400).json({ ok: false, error: "UNSUPPORTED_DIE" });
+  }
+
+  try {
+    const resolved = await resolvePhysicalD20({
+      guildId: String(guildId),
+      channelId: String(channelId),
+      userId: String(userId),
+      naturalRoll: Number(result),
+    });
+
+    if (!resolved.ok) {
+      return res.status(409).json(resolved);
+    }
+
+    return res.json(resolved);
+  } catch (err) {
+    console.error("Dice bridge result error:", err);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
+});
+
+bridgeApp.listen(HTTP_PORT, "0.0.0.0", () => {
+  console.log(`3D dice bridge HTTP API listening on port ${HTTP_PORT}`);
 });
 
 // ============================================================
@@ -2557,6 +2837,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`OpenAI image model: ${OPENAI_IMAGE_MODEL}`);
   console.log(`Image quality: ${OPENAI_IMAGE_QUALITY}`);
   console.log(`AI configured: ${openai ? "YES" : "NO"}`);
+  console.log(`3D dice bridge configured: ${DICE_BRIDGE_SECRET ? "YES" : "NO"}`);
 });
 
 process.on("SIGINT", () => {
