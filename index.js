@@ -236,6 +236,200 @@ const SKILL_TO_ABILITY = {
 };
 
 // ============================================================
+// CHARACTER PROGRESSION
+// ============================================================
+
+// Standard D&D-style cumulative XP thresholds.
+const XP_THRESHOLDS = {
+  1: 0,
+  2: 300,
+  3: 900,
+  4: 2700,
+  5: 6500,
+  6: 14000,
+  7: 23000,
+  8: 34000,
+  9: 48000,
+  10: 64000,
+  11: 85000,
+  12: 100000,
+  13: 120000,
+  14: 140000,
+  15: 165000,
+  16: 195000,
+  17: 225000,
+  18: 265000,
+  19: 305000,
+  20: 355000,
+};
+
+const MAX_CHARACTER_LEVEL = 20;
+
+const CAMPAIGN_COMPLETION_XP = {
+  oneshot: 150,
+  adventure: 250,
+  quest: 400,
+  campaign: 500,
+};
+
+function proficiencyBonusForLevel(level) {
+  return Math.min(6, 2 + Math.floor((Math.max(1, level) - 1) / 4));
+}
+
+function xpForNextLevel(level) {
+  if (level >= MAX_CHARACTER_LEVEL) return null;
+  return XP_THRESHOLDS[level + 1] ?? null;
+}
+
+function normalizeCharacterProgression(character) {
+  character.level = clamp(Number(character.level || 1), 1, MAX_CHARACTER_LEVEL);
+  character.xp = Math.max(0, Number(character.xp || 0));
+  character.levelUpHistory ||= [];
+  return character;
+}
+
+function hpGainForLevel(character) {
+  const classData = CLASS_DATA[character.className];
+  const hitDie = Number(classData?.hitDie || 8);
+  const conMod = Number(character.stats?.CON || 0);
+
+  // Fixed average roll: d6=4, d8=5, d10=6, d12=7, then CON.
+  return Math.max(1, Math.floor(hitDie / 2) + 1 + conMod);
+}
+
+function progressionSummary(character) {
+  normalizeCharacterProgression(character);
+
+  if (character.level >= MAX_CHARACTER_LEVEL) {
+    return `Level **20** • **${character.xp.toLocaleString()} XP** • MAX LEVEL`;
+  }
+
+  const next = xpForNextLevel(character.level);
+  return (
+    `Level **${character.level}** • ` +
+    `**${character.xp.toLocaleString()} / ${next.toLocaleString()} XP**`
+  );
+}
+
+function awardCharacterXP(character, amount, reason = "") {
+  normalizeCharacterProgression(character);
+
+  const gained = Math.max(0, Math.floor(Number(amount || 0)));
+  const oldLevel = character.level;
+  const oldProf = proficiencyBonusForLevel(oldLevel);
+
+  character.xp += gained;
+
+  const levelUps = [];
+
+  while (
+    character.level < MAX_CHARACTER_LEVEL &&
+    character.xp >= XP_THRESHOLDS[character.level + 1]
+  ) {
+    const fromLevel = character.level;
+    character.level += 1;
+
+    const hpGain = hpGainForLevel(character);
+    character.maxHp += hpGain;
+    character.hp = Math.min(character.maxHp, character.hp + hpGain);
+
+    const entry = {
+      at: Date.now(),
+      fromLevel,
+      toLevel: character.level,
+      hpGain,
+      reason,
+    };
+
+    character.levelUpHistory.push(entry);
+    levelUps.push(entry);
+  }
+
+  character.updatedAt = Date.now();
+
+  return {
+    gained,
+    reason,
+    oldLevel,
+    newLevel: character.level,
+    oldProf,
+    newProf: proficiencyBonusForLevel(character.level),
+    levelUps,
+    nextXP: xpForNextLevel(character.level),
+  };
+}
+
+function levelUpEmbed(character, progression) {
+  const classInfo = CLASS_DATA[character.className] || { emoji: "🧙" };
+  const totalHpGained = progression.levelUps.reduce(
+    (sum, x) => sum + x.hpGain,
+    0
+  );
+
+  const fields = [
+    {
+      name: "❤️ Maximum HP",
+      value: `+${totalHpGained} → **${character.maxHp} HP**`,
+      inline: true,
+    },
+    {
+      name: "⭐ XP",
+      value:
+        character.level >= MAX_CHARACTER_LEVEL
+          ? `${character.xp.toLocaleString()} • MAX LEVEL`
+          : `${character.xp.toLocaleString()} / ${progression.nextXP.toLocaleString()}`,
+      inline: true,
+    },
+  ];
+
+  if (progression.newProf > progression.oldProf) {
+    fields.push({
+      name: "🎯 Proficiency Bonus",
+      value: `+${progression.oldProf} → **+${progression.newProf}**`,
+      inline: true,
+    });
+  }
+
+  return new EmbedBuilder()
+    .setTitle(
+      `🎉 LEVEL UP! ${classInfo.emoji} ${character.name} reached Level ${character.level}!`
+    )
+    .setDescription(
+      `Your adventures are making ${character.name} stronger. ` +
+      `Leveling is automatic; your character sheet has already been updated.`
+    )
+    .addFields(fields);
+}
+
+async function announceXP(channel, character, progression, {
+  compact = false,
+} = {}) {
+  if (!progression?.gained) return;
+
+  const nextText =
+    character.level >= MAX_CHARACTER_LEVEL
+      ? "MAX LEVEL"
+      : `${character.xp.toLocaleString()} / ${progression.nextXP.toLocaleString()} XP`;
+
+  if (!compact) {
+    await channel.send({
+      content:
+        `⭐ **${character.name} earned ${progression.gained} XP!**` +
+        (progression.reason ? ` — ${progression.reason}` : "") +
+        `\n${nextText}`,
+      allowedMentions: { parse: [] },
+    });
+  }
+
+  if (progression.levelUps.length) {
+    await channel.send({
+      embeds: [levelUpEmbed(character, progression)],
+      allowedMentions: { parse: [] },
+    });
+  }
+}
+
+// ============================================================
 // DATA STORE
 // ============================================================
 
@@ -378,7 +572,9 @@ function statsForClass(className, style) {
 }
 
 function getCharacter(guildId, userId) {
-  return data.characters[`${guildId}:${userId}`] || null;
+  const character = data.characters[`${guildId}:${userId}`] || null;
+  if (character) normalizeCharacterProgression(character);
+  return character;
 }
 
 function setCharacter(guildId, userId, character) {
@@ -481,8 +677,13 @@ function makeCharacterEmbed(character, ownerName = "") {
         inline: true,
       },
       {
-        name: "⭐ XP",
-        value: `${character.xp}`,
+        name: "⭐ Progress",
+        value: progressionSummary(character),
+        inline: true,
+      },
+      {
+        name: "🎯 Proficiency",
+        value: `+${proficiencyBonusForLevel(character.level)}`,
         inline: true,
       },
       {
@@ -1580,6 +1781,7 @@ async function handleCharacterSelect(interaction) {
         stats,
         level: 1,
         xp: 0,
+        levelUpHistory: [],
         hp: classData.baseHp,
         maxHp: classData.baseHp,
         ac: classData.ac,
@@ -1945,11 +2147,44 @@ async function handleAdventureCommand(interaction) {
       type: "system",
       text: "The party ended this campaign.",
     });
+
+    const completionXP = CAMPAIGN_COMPLETION_XP[campaign.mode] || 250;
+    campaign.completionXPAwarded = true;
+
+    const completionResults = party.memberIds
+      .map((memberId) => {
+        const memberCharacter = getCharacter(guildId, memberId);
+        if (!memberCharacter) return null;
+
+        return {
+          memberId,
+          character: memberCharacter,
+          progression: awardCharacterXP(
+            memberCharacter,
+            completionXP,
+            `${modeLabel(campaign.mode)} completed`
+          ),
+        };
+      })
+      .filter(Boolean);
+
     saveDataSoon();
 
-    return interaction.reply({
-      content: `🏁 **${campaign.title} has ended.**`,
+    await interaction.reply({
+      content:
+        `🏁 **${campaign.title} has ended.**\n` +
+        `⭐ Every participating character earned **${completionXP} XP** for completing the adventure.`,
     });
+
+    for (const result of completionResults) {
+      if (result.progression.levelUps.length) {
+        await interaction.channel.send({
+          embeds: [levelUpEmbed(result.character, result.progression)],
+        });
+      }
+    }
+
+    return;
   }
 
   if (sub === "status") {
@@ -2186,6 +2421,20 @@ async function handleRollCommand(interaction) {
   };
 
   appendLog(campaign, rollRecord);
+
+  const xpAmount =
+    outcome === "SUCCESS"
+      ? 10 + (naturalRoll === 20 ? 5 : 0)
+      : 0;
+
+  const xpProgression = awardCharacterXP(
+    character,
+    xpAmount,
+    naturalRoll === 20
+      ? `${pending.checkName} success + Natural 20`
+      : `${pending.checkName} success`
+  );
+
   saveDataSoon();
 
   const natText =
@@ -2204,8 +2453,17 @@ async function handleRollCommand(interaction) {
       `Natural Roll: **${naturalRoll}**\n` +
       `${pending.ability}: **${formatModifier(modifier)}**\n` +
       `Total: **${total}**${natText}\n\n` +
-      `${resultEmoji} **${outcome}**`,
+      `${resultEmoji} **${outcome}**` +
+      (xpProgression.gained
+        ? `\n⭐ **+${xpProgression.gained} XP**`
+        : ""),
   });
+
+  if (xpProgression.levelUps.length) {
+    await interaction.channel.send({
+      embeds: [levelUpEmbed(character, xpProgression)],
+    });
+  }
 
   try {
     const resolved = await aiResolveCheck(campaign, party, rollRecord, pending);
@@ -2225,6 +2483,203 @@ async function handleRollCommand(interaction) {
     console.error("Resolve-check narration error:", err);
     await interaction.followUp(
       "⚠️ The roll was saved correctly, but the Dungeon Master's follow-up narration failed."
+    );
+  }
+}
+
+// ============================================================
+// LEVEL / PROGRESSION
+// ============================================================
+
+async function handleLevelCommand(interaction) {
+  const character = getCharacter(interaction.guildId, interaction.user.id);
+
+  if (!character) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "Create a character first with `/createcharacter`.",
+    });
+  }
+
+  const nextXP = xpForNextLevel(character.level);
+  const proficiency = proficiencyBonusForLevel(character.level);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`⭐ ${character.name} — Character Progression`)
+    .setDescription(progressionSummary(character))
+    .addFields(
+      {
+        name: "Current Level",
+        value: `${character.level}`,
+        inline: true,
+      },
+      {
+        name: "Proficiency Bonus",
+        value: `+${proficiency}`,
+        inline: true,
+      },
+      {
+        name: "Maximum HP",
+        value: `${character.maxHp}`,
+        inline: true,
+      },
+      {
+        name: "How XP Is Earned",
+        value:
+          "✅ Successful DM-requested check: **10 XP**\\n" +
+          "🌟 Successful Natural 20: **+5 bonus XP**\\n" +
+          "🏁 Finish One-Shot: **150 XP**\\n" +
+          "⚔️ Finish Adventure: **250 XP**\\n" +
+          "🏰 Finish Quest: **400 XP**\\n" +
+          "🐉 Finish Campaign: **500 XP**",
+      }
+    );
+
+  if (nextXP) {
+    embed.addFields({
+      name: "Next Level",
+      value:
+        `Level ${character.level + 1} at **${nextXP.toLocaleString()} XP**\\n` +
+        `${Math.max(0, nextXP - character.xp).toLocaleString()} XP remaining`,
+    });
+  } else {
+    embed.addFields({
+      name: "Next Level",
+      value: "🏆 **MAX LEVEL REACHED**",
+    });
+  }
+
+  return interaction.reply({
+    ephemeral: true,
+    embeds: [embed],
+  });
+}
+
+// ============================================================
+// ASK THE DM — OUT-OF-GAME QUESTIONS
+// ============================================================
+
+const ASK_DM_INSTRUCTIONS = `
+You are the same Dungeon Master who runs this player's Discord D&D adventure,
+but this is an OUT-OF-GAME question.
+
+RULES:
+- Answer the player's question directly and helpfully.
+- Do NOT advance the story.
+- Do NOT narrate new events as if they happened.
+- Do NOT request or resolve dice rolls.
+- Do NOT alter HP, XP, inventory, gold, abilities, campaign state, NPC state, or quests.
+- You may explain rules, the player's character sheet, known campaign lore,
+  what the player currently remembers/knows, or how a mechanic works.
+- You may give strategic options, but never choose an action for the player.
+- If the question asks for information their character has not learned, explain
+  that you cannot reveal undiscovered campaign information.
+- Private character information may be discussed because this response is
+  ephemeral and visible only to the asking player.
+- Keep answers concise and Discord-friendly.
+`;
+
+async function aiAnswerOutOfGameQuestion({
+  character,
+  party,
+  campaign,
+  question,
+}) {
+  if (!openai) {
+    return "⚠️ The AI Dungeon Master is not configured.";
+  }
+
+  const input = JSON.stringify(
+    {
+      playerCharacter: character
+        ? {
+            name: character.name,
+            ancestry: character.ancestry,
+            className: character.className,
+            level: character.level,
+            xp: character.xp,
+            hp: character.hp,
+            maxHp: character.maxHp,
+            ac: character.ac,
+            stats: character.stats,
+            background: character.background,
+            goal: character.goal,
+            fear: character.fear,
+            quirk: character.quirk,
+            backstory: character.backstory,
+            secret: character.secret,
+            inventory: character.inventory,
+            abilities: character.abilities,
+            spells: character.spells || [],
+          }
+        : null,
+      campaign: campaign
+        ? {
+            title: campaign.title,
+            mode: campaign.mode,
+            chapter: campaign.chapter,
+            location: campaign.location,
+            summary: campaign.summary,
+            recentHistory: recentCampaignContext(campaign, 20),
+          }
+        : null,
+      party: party ? partyMembersContext(party) : [],
+      question,
+      request:
+        "Answer this as an out-of-game DM conversation. Do not modify or advance game state.",
+    },
+    null,
+    2
+  );
+
+  const response = await openai.responses.create({
+    model: OPENAI_MODEL,
+    instructions: ASK_DM_INSTRUCTIONS,
+    input,
+  });
+
+  return response.output_text.trim();
+}
+
+async function handleAskDMCommand(interaction) {
+  const question = interaction.options.getString("question", true).trim();
+
+  if (!question) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "Ask the DM a question.",
+    });
+  }
+
+  const character = getCharacter(interaction.guildId, interaction.user.id);
+  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const campaign = party ? getCampaignForParty(party.id) : null;
+
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    const answer = await aiAnswerOutOfGameQuestion({
+      character,
+      party,
+      campaign,
+      question,
+    });
+
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("🎭 Ask the Dungeon Master")
+          .setDescription(truncate(answer, 4000))
+          .setFooter({
+            text:
+              "Out-of-game answer • Does not advance the story or change game state",
+          }),
+      ],
+    });
+  } catch (err) {
+    console.error("/askdm error:", err);
+    return interaction.editReply(
+      "❌ The Dungeon Master couldn't answer that question right now. Check the Railway logs."
     );
   }
 }
@@ -2368,6 +2823,21 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName("level")
+    .setDescription("View your level, XP, and progression."),
+
+  new SlashCommandBuilder()
+    .setName("askdm")
+    .setDescription("Ask the Dungeon Master an out-of-game question privately.")
+    .addStringOption((o) =>
+      o
+        .setName("question")
+        .setDescription("Your question for the DM")
+        .setRequired(true)
+        .setMaxLength(1000)
+    ),
+
+  new SlashCommandBuilder()
     .setName("recap")
     .setDescription("View recent events from your party's campaign."),
 
@@ -2461,6 +2931,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "roll":
           return handleRollCommand(interaction);
 
+        case "level":
+          return handleLevelCommand(interaction);
+
+        case "askdm":
+          return handleAskDMCommand(interaction);
+
         case "recap":
           return handleRecap(interaction);
 
@@ -2484,7 +2960,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   "**5.** Talk normally in the adventure channel to tell the DM what your character does.\n" +
                   "**6.** When the DM requests a check, use `/roll`.\n" +
                   "**7.** `/character`, `/inventory`, `/recap`, and `/adventure status` show saved information.\n" +
-                  "**8.** `/scene` generates the current cinematic scene and `/portrait` creates your character art.\n\n" +
+                  "**8.** `/level` shows your XP and level progression.\n" +
+                  "**9.** `/askdm question:<your question>` privately asks the DM something without advancing the game.\n" +
+                  "**10.** `/scene` generates the current cinematic scene and `/portrait` creates your character art.\n\n" +
                   "🎲 You can also roll manual dice with `/roll dice:2d6+3`.\n" +
                   `🖼️ Automatic cinematic images are limited to ${AUTO_IMAGE_LIMIT} per campaign.`
                 ),
@@ -2650,6 +3128,20 @@ async function resolvePhysicalD20({
   };
 
   appendLog(campaign, rollRecord);
+
+  const xpAmount =
+    outcome === "SUCCESS"
+      ? 10 + (naturalRoll === 20 ? 5 : 0)
+      : 0;
+
+  const xpProgression = awardCharacterXP(
+    character,
+    xpAmount,
+    naturalRoll === 20
+      ? `${pending.checkName} success + Natural 20`
+      : `${pending.checkName} success`
+  );
+
   saveDataSoon();
 
   const channel = await client.channels.fetch(channelId);
@@ -2672,9 +3164,19 @@ async function resolvePhysicalD20({
       `3D Physical Roll: **${naturalRoll}**\n` +
       `${pending.ability}: **${formatModifier(modifier)}**\n` +
       `Total: **${total}**${natText}\n\n` +
-      `${resultEmoji} **${outcome}**`,
+      `${resultEmoji} **${outcome}**` +
+      (xpProgression.gained
+        ? `\n⭐ **+${xpProgression.gained} XP**`
+        : ""),
     allowedMentions: { parse: [] },
   });
+
+  if (xpProgression.levelUps.length) {
+    await channel.send({
+      embeds: [levelUpEmbed(character, xpProgression)],
+      allowedMentions: { parse: [] },
+    });
+  }
 
   try {
     const resolved = await aiResolveCheck(campaign, party, rollRecord, pending);
