@@ -3408,7 +3408,7 @@ function createAIBackstoryIdeaModal(userId) {
     .setMinLength(10)
     .setMaxLength(1000)
     .setPlaceholder(
-      "Example: I grew up in a ruined mining town. My older brother disappeared after finding something beneath the mountain."
+      "Example: I grew up in a ruined mining town, and my brother vanished beneath the mountain."
     );
 
   modal.addComponents(
@@ -3771,18 +3771,46 @@ async function handleCharacterSelect(interaction) {
     creationSessions.set(key, draft);
 
     if (value === "custom") {
-      return interaction.showModal(
-        createCustomBackstoryModal(
+      try {
+        return await interaction.showModal(
+          createCustomBackstoryModal(
+            interaction.user.id
+          )
+        );
+      } catch (err) {
+        console.error("Custom backstory modal open error:", err);
+
+        if (!interaction.replied && !interaction.deferred) {
+          return interaction.reply({
+            ephemeral: true,
+            content:
+              "❌ I couldn't open the custom backstory form. Please try selecting **I already have my backstory** again.",
+          });
+        }
+
+        throw err;
+      }
+    }
+
+    try {
+      return await interaction.showModal(
+        createAIBackstoryIdeaModal(
           interaction.user.id
         )
       );
-    }
+    } catch (err) {
+      console.error("AI backstory modal open error:", err);
 
-    return interaction.showModal(
-      createAIBackstoryIdeaModal(
-        interaction.user.id
-      )
-    );
+      if (!interaction.replied && !interaction.deferred) {
+        return interaction.reply({
+          ephemeral: true,
+          content:
+            "❌ I couldn't open the AI backstory form. Please try selecting **Build one from my idea** again.",
+        });
+      }
+
+      throw err;
+    }
   }
 }
 
@@ -5403,7 +5431,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Downtime target: after ${DOWNTIME_AFTER_ACTION_BEATS} action beats when safe`);
   console.log("Turn-based Combat v1: ENABLED");
   console.log("Character backstory choice: PLAYER-WRITTEN or AI-GENERATED");
-  console.log("Backstory modal hotfix v1.7.1: ENABLED");
+  console.log("Backstory modal hotfix v1.7.2: ENABLED");
 });
 
 process.on("SIGINT", () => {
