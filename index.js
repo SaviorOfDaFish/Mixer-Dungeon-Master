@@ -1073,6 +1073,8 @@ async function handleRestCommand(interaction) {
       character.hp = Math.min(character.maxHp, character.hp + heal);
     }
 
+    restoreAbilityUses(character, type);
+
     results.push(
       `**${character.name}:** ${before} → **${character.hp}/${character.maxHp} HP**`
     );
@@ -1295,7 +1297,8 @@ function combatStatusEmbed(campaign, party) {
     const character = getCharacter(campaign.guildId, userId);
     if (!character) return `❔ Unknown adventurer`;
 
-    return `${character.hp > 0 ? "❤️" : "💀"} **${character.name}** — ${Math.max(0, character.hp)}/${character.maxHp} HP • AC ${character.ac}`;
+    const position = getCombatPosition(campaign, userId, character);
+    return `${character.hp > 0 ? "❤️" : "💀"} **${character.name}** — ${Math.max(0, character.hp)}/${character.maxHp} HP • AC ${character.ac} • ${positionEmoji(position)} ${positionLabel(position)}`;
   });
 
   const enemyLines = (combat.enemies || []).map((enemy) => {
@@ -1390,6 +1393,15 @@ async function startCombatFromDM(campaign, party, channel, result) {
 
   initiative.sort((a, b) => b.total - a.total);
 
+  const positions = {};
+  const threat = {};
+  for (const userId of party.memberIds) {
+    const character = getCharacter(campaign.guildId, userId);
+    if (!character) continue;
+    positions[userId] = defaultCombatPosition(character);
+    threat[userId] = 0;
+  }
+
   campaign.combat = {
     active: true,
     round: 1,
@@ -1398,6 +1410,11 @@ async function startCombatFromDM(campaign, party, channel, result) {
     initiative,
     startedAt: Date.now(),
     threatName: name,
+    positions,
+    threat,
+    effects: {},
+    targetMemory: { lastUserId: null, streak: 0 },
+    positionMovedRound: {},
   };
 
   normalizeCampaignPacing(campaign);
@@ -1641,7 +1658,12 @@ async function processCombatPlayerMessage(message, campaign, party) {
         checkName: result.check_name,
         ability,
         dice: "1d20",
-        rollMode: normalizeRollMode(result.roll_mode),
+        rollMode: combatAttackRollMode(
+          campaign,
+          message.author.id,
+          result.roll_mode,
+          result.check_name
+        ),
         dc: target.ac,
         reason:
           result.roll_reason ||
@@ -1728,40 +1750,33 @@ function effectiveCharacterAC(campaign, userId, character) {
 }
 
 async function runEnemyTurn(campaign, party, channel, enemy) {
-  const conscious = consciousPartyMembers(campaign, party);
-
-  if (!conscious.length) {
+  const chosen = chooseEnemyTarget(campaign, party, enemy);
+  if (!chosen) {
     await endCombatDefeat(campaign, party, channel);
     return;
   }
 
-  // Attack the conscious party member with the lowest current HP.
-  conscious.sort((a, b) => a.character.hp - b.character.hp);
-  const target = conscious[0];
-  const targetAC = effectiveCharacterAC(
-    campaign,
-    target.id,
-    target.character
-  );
-
-  const natural = 1 + Math.floor(Math.random() * 20);
+  const target = { id: chosen.id, character: chosen.character };
+  const targetAC = effectiveCharacterAC(campaign, target.id, target.character);
+  const effects = getCombatEffects(campaign, target.id);
+  const hasAdvantage = Boolean(effects.recklessExposed);
+  const attackRolls = hasAdvantage
+    ? [1 + Math.floor(Math.random() * 20), 1 + Math.floor(Math.random() * 20)]
+    : [1 + Math.floor(Math.random() * 20)];
+  const natural = hasAdvantage ? Math.max(...attackRolls) : attackRolls[0];
   const total = natural + enemy.attackBonus;
   const hit = natural === 20 || (natural !== 1 && total >= targetAC);
 
   let damage = 0;
-
+  let rageReduced = false;
   if (hit) {
-    const damageRoll = rollDice(
-      natural === 20
-        ? doubleDamageDice(enemy.damageDice)
-        : enemy.damageDice
-    );
-
+    const damageRoll = rollDice(natural === 20 ? doubleDamageDice(enemy.damageDice) : enemy.damageDice);
     damage = Math.max(1, damageRoll?.total || 1);
-    target.character.hp = Math.max(
-      0,
-      target.character.hp - damage
-    );
+    if (effects.rage) {
+      damage = Math.max(1, Math.floor(damage / 2));
+      rageReduced = true;
+    }
+    target.character.hp = Math.max(0, target.character.hp - damage);
     target.character.updatedAt = Date.now();
   }
 
@@ -1770,17 +1785,17 @@ async function runEnemyTurn(campaign, party, channel, enemy) {
   await channel.send({
     content:
       `👹 **${enemy.name}'s Turn**\n` +
-      `Attack Roll: **${natural}** + ${enemy.attackBonus} = **${total}** vs ${target.character.name}'s AC **${targetAC}**\n` +
+      `🎯 ${enemy.name} ${chosen.reason}: **${target.character.name}** (${positionLabel(chosen.position)}).\n` +
+      (hasAdvantage
+        ? `🟢 Advantage: **${attackRolls[0]} / ${attackRolls[1]}** → kept **${natural}** + ${enemy.attackBonus} = **${total}** vs AC **${targetAC}**\n`
+        : `Attack Roll: **${natural}** + ${enemy.attackBonus} = **${total}** vs AC **${targetAC}**\n`) +
       (hit
-        ? `💥 **HIT! ${damage} damage.** ${target.character.name}: **${target.character.hp}/${target.character.maxHp} HP**`
+        ? `💥 **HIT! ${damage} damage.** ${rageReduced ? "🔥 Rage reduced the damage. " : ""}${target.character.name}: **${target.character.hp}/${target.character.maxHp} HP**`
         : `💨 **MISS!**`) +
-      (target.character.hp <= 0
-        ? `\n💀 **${target.character.name} is down!**`
-        : ""),
+      (target.character.hp <= 0 ? `\n💀 **${target.character.name} is down!**` : ""),
     allowedMentions: { parse: [] },
   });
 }
-
 async function advanceCombatTurn(campaign, party, channel) {
   const combat = campaign.combat;
   if (!combat?.active) return;
@@ -1838,6 +1853,9 @@ async function advanceCombatTurn(campaign, party, channel) {
 
     combat.defending ||= {};
     delete combat.defending[turn.userId];
+    const effects = getCombatEffects(campaign, turn.userId);
+    delete effects.recklessExposed;
+    delete effects.recklessNext;
 
     saveDataSoon();
 
@@ -1943,10 +1961,9 @@ async function resolveCombatAttackAfterRoll({
         : pending.combatDamageDice || "1d6";
 
     const damageRoll = rollDice(damageExpression);
-    const damage = Math.max(
-      1,
-      damageRoll?.total || 1
-    );
+    const baseDamage = Math.max(1, damageRoll?.total || 1);
+    const damageResult = applyCombatDamageBonuses(campaign, party, character, pending, enemy, baseDamage);
+    const damage = damageResult.damage;
 
     enemy.hp = Math.max(0, enemy.hp - damage);
 
@@ -1961,6 +1978,7 @@ async function resolveCombatAttackAfterRoll({
         `💥 **${character.name} hits ${enemy.name}!**\n` +
         `${naturalRoll === 20 ? "🌟 **CRITICAL HIT!**\n" : ""}` +
         `Damage: **${damage}** (${damageExpression})\n` +
+        (damageResult.bonuses.length ? `${damageResult.bonuses.join(" • ")}\n` : "") +
         `${enemy.name}: **${enemy.hp}/${enemy.maxHp} HP**` +
         (enemy.defeated ? `\n☠️ **${enemy.name} is defeated!**` : ""),
       allowedMentions: { parse: [] },
@@ -2024,7 +2042,9 @@ async function resolveCombatAttackAfterPhysicalRoll({
         : pending.combatDamageDice || "1d6";
 
     const damageRoll = rollDice(damageExpression);
-    const damage = Math.max(1, damageRoll?.total || 1);
+    const baseDamage = Math.max(1, damageRoll?.total || 1);
+    const damageResult = applyCombatDamageBonuses(campaign, party, character, pending, enemy, baseDamage);
+    const damage = damageResult.damage;
 
     enemy.hp = Math.max(0, enemy.hp - damage);
 
@@ -2052,6 +2072,7 @@ async function resolveCombatAttackAfterPhysicalRoll({
         `💥 **${character.name} hits ${enemy.name}!**\n` +
         `${naturalRoll === 20 ? "🌟 **CRITICAL HIT!**\n" : ""}` +
         `🎲 Damage: **${damage}** (${damageExpression})\n` +
+        (damageResult.bonuses.length ? `${damageResult.bonuses.join(" • ")}\n` : "") +
         `❤️ ${enemy.name}: **${enemy.hp}/${enemy.maxHp} HP**` +
         (enemy.defeated
           ? `\n☠️ **${enemy.name} is defeated!**`
@@ -2198,6 +2219,404 @@ async function endCombatDefeat(campaign, party, channel) {
 }
 
 // ============================================================
+// CLASS ABILITIES + SMART TARGETING v1.8
+// ============================================================
+
+const COMBAT_POSITIONS = ["frontline", "midline", "backline"];
+
+const ABILITY_DEFINITIONS = {
+  "Second Wind": { type: "active", recharge: "short", maxUses: 1, description: "Heal 1d10 + Fighter level." },
+  "Weapon Training": { type: "passive", description: "Passive Fighter combat training." },
+  Rage: { type: "active", recharge: "long", maxUses: 2, description: "+2 melee damage and half enemy weapon damage for the encounter." },
+  "Reckless Strike": { type: "active", description: "Next melee attack gains Advantage; enemies gain Advantage against you until your next turn." },
+  "Sneak Attack": { type: "active", description: "Arm +1d6 on your next qualifying hit this round." },
+  "Cunning Action": { type: "active", description: "Quickly reposition between combat distance bands." },
+  "Hunter's Mark": { type: "active", recharge: "long", maxUses: 2, description: "Marked enemy takes +1d6 from your successful attacks." },
+  Trailwise: { type: "passive", description: "Passive wilderness and tracking expertise." },
+  "Arcane Recovery": { type: "active", recharge: "long", maxUses: 1, description: "Tracked magical recovery; full spell-slot integration comes later." },
+  Spellcasting: { type: "passive", description: "Spellcasting is interpreted by the DM; full spell-slot tracking comes later." },
+  "Divine Spark": { type: "active", recharge: "long", maxUses: 2, description: "Heal yourself or an ally for 1d8 + WIS." },
+  "Bardic Inspiration": { type: "active", recharge: "long", maxUses: 3, description: "Tracked inspiration resource; d6 roll integration is the next spell/support pass." },
+  "Eldritch Blast": { type: "active", description: "At-will CHA spell attack for 1d10 damage." },
+  "Pact Magic": { type: "passive", description: "Pact magic is interpreted by the DM; pact-slot tracking comes later." },
+};
+
+function defaultCombatPosition(character) {
+  const saved = String(character?.preferredCombatPosition || "").toLowerCase();
+  if (COMBAT_POSITIONS.includes(saved)) return saved;
+  if (["Fighter", "Barbarian", "Cleric"].includes(character?.className)) return "frontline";
+  if (["Wizard", "Warlock"].includes(character?.className)) return "backline";
+  return "midline";
+}
+
+function positionEmoji(position) {
+  return position === "frontline" ? "🛡️" : position === "backline" ? "🏹" : "⚔️";
+}
+
+function positionLabel(position) {
+  return position === "frontline" ? "Frontline" : position === "backline" ? "Backline" : "Midline";
+}
+
+function normalizeAbilityState(character) {
+  character.abilityState ||= { uses: {}, active: {} };
+  character.abilityState.uses ||= {};
+  character.abilityState.active ||= {};
+
+  for (const name of character.abilities || []) {
+    const def = ABILITY_DEFINITIONS[name];
+    if (!def?.maxUses) continue;
+    if (!Number.isFinite(character.abilityState.uses[name])) {
+      character.abilityState.uses[name] = def.maxUses;
+    } else {
+      character.abilityState.uses[name] = Math.max(0, Math.min(def.maxUses, character.abilityState.uses[name]));
+    }
+  }
+  return character.abilityState;
+}
+
+function abilityUsesText(character, name) {
+  normalizeAbilityState(character);
+  const def = ABILITY_DEFINITIONS[name];
+  if (!def) return "Available";
+  if (def.type === "passive") return "Passive";
+  if (!def.maxUses) return "At will";
+  return `${character.abilityState.uses[name]}/${def.maxUses} • ${def.recharge === "short" ? "Short/Long Rest" : "Long Rest"}`;
+}
+
+function consumeAbilityUse(character, name) {
+  normalizeAbilityState(character);
+  const def = ABILITY_DEFINITIONS[name];
+  if (!def?.maxUses) return true;
+  if ((character.abilityState.uses[name] || 0) <= 0) return false;
+  character.abilityState.uses[name] -= 1;
+  character.updatedAt = Date.now();
+  return true;
+}
+
+function restoreAbilityUses(character, restType) {
+  normalizeAbilityState(character);
+  for (const name of character.abilities || []) {
+    const def = ABILITY_DEFINITIONS[name];
+    if (!def?.maxUses) continue;
+    if (restType === "long" || (restType === "short" && def.recharge === "short")) {
+      character.abilityState.uses[name] = def.maxUses;
+    }
+  }
+}
+
+function getCombatEffects(campaign, userId) {
+  campaign.combat ||= {};
+  campaign.combat.effects ||= {};
+  campaign.combat.effects[userId] ||= {};
+  return campaign.combat.effects[userId];
+}
+
+function getCombatPosition(campaign, userId, character) {
+  campaign.combat ||= {};
+  campaign.combat.positions ||= {};
+  campaign.combat.positions[userId] ||= defaultCombatPosition(character);
+  return campaign.combat.positions[userId];
+}
+
+function isPlayersCombatTurn(campaign, userId) {
+  const turn = currentCombatant(campaign);
+  return Boolean(turn?.type === "player" && turn.userId === userId);
+}
+
+function findEnemyByName(campaign, targetText) {
+  const living = livingEnemies(campaign);
+  const wanted = String(targetText || "").trim().toLowerCase();
+  if (!living.length) return null;
+  if (!wanted) return living[0];
+  return living.find((e) => e.name.toLowerCase() === wanted)
+    || living.find((e) => e.name.toLowerCase().includes(wanted))
+    || null;
+}
+
+function findPartyCharacterByName(party, guildId, targetText) {
+  const wanted = String(targetText || "").trim().toLowerCase();
+  if (!wanted) return null;
+  return party.memberIds
+    .map((userId) => ({ userId, character: getCharacter(guildId, userId) }))
+    .filter((x) => x.character)
+    .find((x) => x.character.name.toLowerCase() === wanted || x.character.name.toLowerCase().includes(wanted)) || null;
+}
+
+function addCombatThreat(campaign, userId, amount) {
+  if (!campaign?.combat?.active) return;
+  campaign.combat.threat ||= {};
+  campaign.combat.threat[userId] = Number(campaign.combat.threat[userId] || 0) + Math.max(0, Number(amount || 0));
+}
+
+function weightedPick(items) {
+  const total = items.reduce((sum, item) => sum + Math.max(0, item.weight), 0);
+  if (total <= 0) return items[Math.floor(Math.random() * items.length)] || null;
+  let cursor = Math.random() * total;
+  for (const item of items) {
+    cursor -= Math.max(0, item.weight);
+    if (cursor <= 0) return item;
+  }
+  return items[items.length - 1] || null;
+}
+
+function chooseEnemyTarget(campaign, party, enemy) {
+  const conscious = consciousPartyMembers(campaign, party);
+  if (!conscious.length) return null;
+
+  const combat = campaign.combat;
+  combat.threat ||= {};
+  combat.targetMemory ||= { lastUserId: null, streak: 0 };
+
+  const tables = {
+    minion: { frontline: 4.5, midline: 2.0, backline: 0.8 },
+    brute: { frontline: 5.5, midline: 1.8, backline: 0.5 },
+    skirmisher: { frontline: 1.4, midline: 3.0, backline: 3.6 },
+    caster: { frontline: 0.9, midline: 2.5, backline: 4.2 },
+    boss: { frontline: 2.8, midline: 2.8, backline: 2.8 },
+  };
+  const table = tables[enemy.archetype] || tables.skirmisher;
+
+  const choices = conscious.map(({ id, character }) => {
+    const position = getCombatPosition(campaign, id, character);
+    const threat = Number(combat.threat[id] || 0);
+    const hpRatio = character.maxHp ? character.hp / character.maxHp : 1;
+    let weight = Number(table[position] || 1);
+    weight *= 1 + Math.min(1.5, threat / (enemy.archetype === "boss" ? 10 : 20));
+    weight *= 1 + (1 - hpRatio) * 0.55;
+    if (combat.defending?.[id]) weight *= 1.15;
+    if (combat.targetMemory.lastUserId === id) {
+      weight *= combat.targetMemory.streak >= 2 ? 0.16 : 0.40;
+    }
+    weight *= 0.75 + Math.random() * 0.5;
+    return { id, character, position, threat, weight };
+  });
+
+  const chosen = weightedPick(choices);
+  if (!chosen) return null;
+
+  if (combat.targetMemory.lastUserId === chosen.id) combat.targetMemory.streak += 1;
+  else {
+    combat.targetMemory.lastUserId = chosen.id;
+    combat.targetMemory.streak = 1;
+  }
+
+  let reason = "spots an opening";
+  if (["brute", "minion"].includes(enemy.archetype) && chosen.position === "frontline") reason = "presses the frontline";
+  else if (["skirmisher", "caster"].includes(enemy.archetype) && chosen.position === "backline") reason = "finds a path toward the backline";
+  else if (chosen.threat >= 8) reason = "turns toward the adventurer drawing the most threat";
+  else if (chosen.character.hp / chosen.character.maxHp < 0.45) reason = "notices a wounded adventurer";
+
+  return { ...chosen, reason };
+}
+
+function combatAttackRollMode(campaign, userId, requestedMode, checkName) {
+  const effects = getCombatEffects(campaign, userId);
+  if (checkName === "Attack" && effects.recklessNext) {
+    effects.recklessNext = false;
+    effects.recklessExposed = true;
+    return "advantage";
+  }
+  return normalizeRollMode(requestedMode);
+}
+
+function applyCombatDamageBonuses(campaign, party, character, pending, enemy, baseDamage) {
+  const effects = getCombatEffects(campaign, character.userId);
+  let damage = baseDamage;
+  const bonuses = [];
+
+  if (effects.rage && pending.checkName === "Attack") {
+    damage += 2;
+    bonuses.push("🔥 Rage +2");
+  }
+
+  if (effects.huntersMarkTargetId === enemy.id) {
+    const extra = rollDice("1d6")?.total || 1;
+    damage += extra;
+    bonuses.push(`🏹 Hunter's Mark +${extra}`);
+  }
+
+  if (effects.sneakAttackArmed && effects.sneakAttackUsedRound !== campaign.combat.round) {
+    const allyFrontline = party.memberIds.some((id) => {
+      if (id === character.userId) return false;
+      const ally = getCharacter(campaign.guildId, id);
+      return ally && ally.hp > 0 && getCombatPosition(campaign, id, ally) === "frontline";
+    });
+    if (pending.rollMode === "advantage" || allyFrontline) {
+      const extra = rollDice("1d6")?.total || 1;
+      damage += extra;
+      bonuses.push(`🗡️ Sneak Attack +${extra}`);
+      effects.sneakAttackArmed = false;
+      effects.sneakAttackUsedRound = campaign.combat.round;
+    }
+  }
+
+  addCombatThreat(campaign, character.userId, damage);
+  return { damage, bonuses };
+}
+
+async function handleAbilitiesCommand(interaction) {
+  const character = getCharacter(interaction.guildId, interaction.user.id);
+  if (!character) return interaction.reply({ ephemeral: true, content: "Create a character first with `/createcharacter`." });
+  normalizeAbilityState(character);
+  const lines = (character.abilities || []).map((name) => {
+    const def = ABILITY_DEFINITIONS[name];
+    return `**${name}** — ${abilityUsesText(character, name)}\n${def?.description || "Character feature."}`;
+  });
+  return interaction.reply({
+    ephemeral: true,
+    embeds: [new EmbedBuilder().setTitle(`✨ ${character.name} — Abilities`).setDescription(lines.join("\n\n") || "No abilities found.").setFooter({ text: "Use /useability with the exact ability name shown here." })],
+  });
+}
+
+async function handlePositionCommand(interaction) {
+  const character = getCharacter(interaction.guildId, interaction.user.id);
+  if (!character) return interaction.reply({ ephemeral: true, content: "Create a character first." });
+  const position = interaction.options.getString("position", true);
+  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const campaign = party ? getActiveCampaignForChannel(interaction.guildId, interaction.channelId) : null;
+
+  if (!campaign?.combat?.active) {
+    character.preferredCombatPosition = position;
+    saveDataSoon();
+    return interaction.reply({ ephemeral: true, content: `${positionEmoji(position)} **Default combat position set to ${positionLabel(position)}.**` });
+  }
+
+  if (!isPlayersCombatTurn(campaign, interaction.user.id)) {
+    return interaction.reply({ ephemeral: true, content: "⏳ Change position on your own turn." });
+  }
+
+  campaign.combat.positionMovedRound ||= {};
+  if (campaign.combat.positionMovedRound[interaction.user.id] === campaign.combat.round) {
+    return interaction.reply({ ephemeral: true, content: "You already changed position this round." });
+  }
+
+  campaign.combat.positions[interaction.user.id] = position;
+  campaign.combat.positionMovedRound[interaction.user.id] = campaign.combat.round;
+  character.preferredCombatPosition = position;
+  saveDataSoon();
+  return interaction.reply({ content: `${positionEmoji(position)} **${character.name} moves to the ${positionLabel(position)}.**` });
+}
+
+async function handleUseAbilityCommand(interaction) {
+  const character = getCharacter(interaction.guildId, interaction.user.id);
+  if (!character) return interaction.reply({ ephemeral: true, content: "Create a character first." });
+
+  const requested = interaction.options.getString("ability", true).trim();
+  const targetText = interaction.options.getString("target")?.trim() || "";
+  const ability = (character.abilities || []).find((name) => name.toLowerCase() === requested.toLowerCase());
+  if (!ability) return interaction.reply({ ephemeral: true, content: `**${requested}** is not on your sheet. Use \`/abilities\` for exact names.` });
+
+  const def = ABILITY_DEFINITIONS[ability];
+  if (!def || def.type === "passive") {
+    return interaction.reply({ ephemeral: true, content: `ℹ️ **${ability}** is passive. ${def?.description || ""}` });
+  }
+
+  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const campaign = party ? getActiveCampaignForChannel(interaction.guildId, interaction.channelId) : null;
+  const combat = campaign?.combat?.active ? campaign.combat : null;
+
+  if (ability === "Second Wind") {
+    if (!consumeAbilityUse(character, ability)) return interaction.reply({ ephemeral: true, content: "❌ Second Wind is spent until a Short or Long Rest." });
+    const heal = (rollDice("1d10")?.total || 1) + character.level;
+    const before = character.hp;
+    character.hp = Math.min(character.maxHp, character.hp + heal);
+    saveDataSoon();
+    return interaction.reply({ content: `💨 **${character.name} uses Second Wind!**\n❤️ ${before} → **${character.hp}/${character.maxHp} HP**\nUses remaining: **${character.abilityState.uses[ability]}**` });
+  }
+
+  if (ability === "Rage") {
+    if (!combat) return interaction.reply({ ephemeral: true, content: "Rage can only be activated during combat." });
+    if (!consumeAbilityUse(character, ability)) return interaction.reply({ ephemeral: true, content: "❌ No Rages remain until a Long Rest." });
+    getCombatEffects(campaign, interaction.user.id).rage = true;
+    saveDataSoon();
+    return interaction.reply({ content: `🔥 **${character.name} enters a RAGE!**\nMelee damage **+2** • Enemy weapon damage **halved**\nRages remaining: **${character.abilityState.uses[ability]}**` });
+  }
+
+  if (ability === "Reckless Strike") {
+    if (!combat || !isPlayersCombatTurn(campaign, interaction.user.id)) return interaction.reply({ ephemeral: true, content: "Use Reckless Strike during your own combat turn." });
+    getCombatEffects(campaign, interaction.user.id).recklessNext = true;
+    saveDataSoon();
+    return interaction.reply({ content: `🪓 **${character.name} attacks recklessly!**\nNext melee attack: **Advantage**. Enemy attacks against you: **Advantage** until your next turn.` });
+  }
+
+  if (ability === "Sneak Attack") {
+    if (!combat || !isPlayersCombatTurn(campaign, interaction.user.id)) return interaction.reply({ ephemeral: true, content: "Arm Sneak Attack during your combat turn." });
+    const effects = getCombatEffects(campaign, interaction.user.id);
+    if (effects.sneakAttackUsedRound === combat.round) return interaction.reply({ ephemeral: true, content: "Sneak Attack was already used this round." });
+    effects.sneakAttackArmed = true;
+    saveDataSoon();
+    return interaction.reply({ content: `🗡️ **Sneak Attack armed.** Your next qualifying hit this round deals **+1d6**.` });
+  }
+
+  if (ability === "Cunning Action") {
+    const position = targetText.toLowerCase();
+    if (!COMBAT_POSITIONS.includes(position)) return interaction.reply({ ephemeral: true, content: "Use target `frontline`, `midline`, or `backline`." });
+    if (!combat || !isPlayersCombatTurn(campaign, interaction.user.id)) return interaction.reply({ ephemeral: true, content: "Use Cunning Action during your own combat turn." });
+    combat.positions[interaction.user.id] = position;
+    character.preferredCombatPosition = position;
+    saveDataSoon();
+    return interaction.reply({ content: `💨 **${character.name} uses Cunning Action** and slips to the **${positionLabel(position)}**.` });
+  }
+
+  if (ability === "Hunter's Mark") {
+    if (!combat) return interaction.reply({ ephemeral: true, content: "Hunter's Mark currently targets enemies during combat." });
+    const enemy = findEnemyByName(campaign, targetText);
+    if (!enemy) return interaction.reply({ ephemeral: true, content: "Enemy not found. Use `/combat status` for names." });
+    if (!consumeAbilityUse(character, ability)) return interaction.reply({ ephemeral: true, content: "❌ No Hunter's Mark uses remain until a Long Rest." });
+    getCombatEffects(campaign, interaction.user.id).huntersMarkTargetId = enemy.id;
+    saveDataSoon();
+    return interaction.reply({ content: `🏹 **${enemy.name} is marked.** Successful attacks against it deal **+1d6 damage**.\nMarks remaining: **${character.abilityState.uses[ability]}**` });
+  }
+
+  if (ability === "Divine Spark") {
+    if (!party) return interaction.reply({ ephemeral: true, content: "Join a party first." });
+    const target = targetText ? findPartyCharacterByName(party, interaction.guildId, targetText) : { userId: interaction.user.id, character };
+    if (!target) return interaction.reply({ ephemeral: true, content: "Party member not found by character name." });
+    if (!consumeAbilityUse(character, ability)) return interaction.reply({ ephemeral: true, content: "❌ No Divine Spark uses remain until a Long Rest." });
+    const heal = (rollDice("1d8")?.total || 1) + Number(character.stats?.WIS || 0);
+    const before = target.character.hp;
+    target.character.hp = Math.min(target.character.maxHp, target.character.hp + heal);
+    addCombatThreat(campaign, interaction.user.id, Math.max(1, target.character.hp - before) / 2);
+    saveDataSoon();
+    await interaction.reply({ content: `✨ **${character.name} uses Divine Spark on ${target.character.name}!**\n❤️ ${before} → **${target.character.hp}/${target.character.maxHp} HP**\nUses remaining: **${character.abilityState.uses[ability]}**` });
+    if (combat && isPlayersCombatTurn(campaign, interaction.user.id)) await advanceCombatTurn(campaign, party, interaction.channel);
+    return;
+  }
+
+  if (ability === "Bardic Inspiration") {
+    if (!consumeAbilityUse(character, ability)) return interaction.reply({ ephemeral: true, content: "❌ No Bardic Inspiration uses remain until a Long Rest." });
+    saveDataSoon();
+    return interaction.reply({ content: `🎵 **${character.name} uses Bardic Inspiration.**\nThe use is tracked now; the actual d6 bonus-roll hook will be added with the support/spell resource pass.\nUses remaining: **${character.abilityState.uses[ability]}**` });
+  }
+
+  if (ability === "Eldritch Blast") {
+    if (!combat || !party || !isPlayersCombatTurn(campaign, interaction.user.id)) return interaction.reply({ ephemeral: true, content: "Use Eldritch Blast during your own combat turn." });
+    const enemy = findEnemyByName(campaign, targetText);
+    if (!enemy) return interaction.reply({ ephemeral: true, content: "Enemy not found. Use `/combat status` for names." });
+    if (campaign.pendingChecks?.[interaction.user.id]) return interaction.reply({ ephemeral: true, content: "Resolve your current pending roll first." });
+
+    campaign.pendingChecks ||= {};
+    const pending = {
+      id: uid(), checkName: "SpellAttack", ability: "CHA", dice: "1d20", rollMode: "normal", dc: enemy.ac,
+      reason: `Blast ${enemy.name} with eldritch power.`, successDirection: `Hit ${enemy.name}.`, failureDirection: `Miss ${enemy.name}.`,
+      channelId: campaign.channelId, createdAt: Date.now(), combatAttack: true, combatTargetId: enemy.id,
+      combatDamageDice: "1d10", noCheckXP: true,
+    };
+    campaign.pendingChecks[interaction.user.id] = pending;
+    saveDataSoon();
+    return interaction.reply({ content: `🌑 **${character.name} casts Eldritch Blast at ${enemy.name}!**\n🎲 Make a **CHA spell attack**.`, components: [make3DDiceButton(pending)] });
+  }
+
+  if (ability === "Arcane Recovery") {
+    if (!consumeAbilityUse(character, ability)) return interaction.reply({ ephemeral: true, content: "❌ Arcane Recovery is spent until a Long Rest." });
+    saveDataSoon();
+    return interaction.reply({ content: `🧙 **${character.name} uses Arcane Recovery.** The use is now tracked; full spell-slot recovery plugs into this when spell slots arrive.` });
+  }
+
+  return interaction.reply({ ephemeral: true, content: `ℹ️ **${ability}** does not yet have a mechanical handler.` });
+}
+
+// ============================================================
 // DATA STORE
 // ============================================================
 
@@ -2341,7 +2760,11 @@ function statsForClass(className, style) {
 
 function getCharacter(guildId, userId) {
   const character = data.characters[`${guildId}:${userId}`] || null;
-  if (character) normalizeCharacterProgression(character);
+  if (character) {
+    normalizeCharacterProgression(character);
+    normalizeAbilityState(character);
+    character.preferredCombatPosition ||= defaultCombatPosition(character);
+  }
   return character;
 }
 
@@ -5082,6 +5505,31 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName("abilities")
+    .setDescription("View your class abilities and remaining uses."),
+
+  new SlashCommandBuilder()
+    .setName("useability")
+    .setDescription("Use one of your active class abilities.")
+    .addStringOption((o) =>
+      o.setName("ability").setDescription("Exact ability name from /abilities").setRequired(true).setMaxLength(60)
+    )
+    .addStringOption((o) =>
+      o.setName("target").setDescription("Optional enemy, ally, or position target").setRequired(false).setMaxLength(80)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("position")
+    .setDescription("Set your Frontline, Midline, or Backline combat position.")
+    .addStringOption((o) =>
+      o.setName("position").setDescription("Combat distance band").setRequired(true).addChoices(
+        { name: "🛡️ Frontline", value: "frontline" },
+        { name: "⚔️ Midline", value: "midline" },
+        { name: "🏹 Backline", value: "backline" }
+      )
+    ),
+
+  new SlashCommandBuilder()
     .setName("ready")
     .setDescription("Mark your current party action as ready for the DM."),
 
@@ -5214,6 +5662,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         case "roll":
           return handleRollCommand(interaction);
+
+        case "abilities":
+          return handleAbilitiesCommand(interaction);
+
+        case "useability":
+          return handleUseAbilityCommand(interaction);
+
+        case "position":
+          return handlePositionCommand(interaction);
 
         case "ready":
           return handleReadyCommand(interaction);
@@ -5801,6 +6258,8 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log("3D dice multiplayer/voice-channel bridge fix v1.7.3: ENABLED");
   console.log("Advantage / Disadvantage v1.7.4: ENABLED");
   console.log("3D combat resolution hotfix v1.7.5: ENABLED");
+  console.log("Class abilities v1.8: ENABLED");
+  console.log("Smart enemy targeting + combat distance bands v1.8: ENABLED");
 });
 
 process.on("SIGINT", () => {
