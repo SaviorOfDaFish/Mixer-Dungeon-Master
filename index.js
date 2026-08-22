@@ -42,6 +42,7 @@ const SCENE_COOLDOWN_MS = 10 * 60 * 1000;
 const PORTRAIT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const DICE_BRIDGE_SECRET = process.env.DICE_BRIDGE_SECRET || "";
 const HTTP_PORT = Number(process.env.PORT || 3000);
+const PARTY_ACTION_WINDOW_MS = 20 * 1000;
 
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN.");
 if (!DISCORD_CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID.");
@@ -427,6 +428,469 @@ async function announceXP(channel, character, progression, {
       allowedMentions: { parse: [] },
     });
   }
+}
+
+// ============================================================
+// MULTIPLAYER PARTY ACTION WINDOW
+// ============================================================
+//
+// Exploration/social play is batched for 20 seconds after the MOST RECENT
+// party message. Any new participant message resets the window.
+//
+// /ready marks a participant ready. Only players who actually contributed to
+// the current batch count toward readiness. If every participant is ready,
+// the DM processes the batch immediately.
+//
+// Pending DM rolls pause batch resolution. Players may keep declaring actions
+// while a roll is pending, but the DM will not advance past the unresolved roll.
+
+const partyActionWindows = new Map();
+
+function getPartyWindow(campaignId) {
+  return partyActionWindows.get(campaignId) || null;
+}
+
+function ensurePartyWindow(campaign, channel) {
+  let windowState = partyActionWindows.get(campaign.id);
+
+  if (!windowState) {
+    windowState = {
+      campaignId: campaign.id,
+      guildId: campaign.guildId,
+      channelId: campaign.channelId,
+      channel,
+      actions: [],
+      participants: new Set(),
+      ready: new Set(),
+      timer: null,
+      deadline: null,
+      processing: false,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    partyActionWindows.set(campaign.id, windowState);
+  } else if (channel) {
+    windowState.channel = channel;
+  }
+
+  return windowState;
+}
+
+function clearPartyWindowTimer(windowState) {
+  if (windowState?.timer) {
+    clearTimeout(windowState.timer);
+    windowState.timer = null;
+  }
+
+  if (windowState) windowState.deadline = null;
+}
+
+function pendingRollCount(campaign) {
+  return Object.keys(campaign.pendingChecks || {}).length;
+}
+
+function partyWindowParticipants(windowState) {
+  return [...(windowState?.participants || [])];
+}
+
+function everyoneInWindowReady(windowState) {
+  const participants = partyWindowParticipants(windowState);
+  return (
+    participants.length > 0 &&
+    participants.every((userId) => windowState.ready.has(userId))
+  );
+}
+
+function partyWindowRemainingSeconds(windowState) {
+  if (!windowState?.deadline) return null;
+  return Math.max(0, Math.ceil((windowState.deadline - Date.now()) / 1000));
+}
+
+function schedulePartyWindow(campaign, party, channel) {
+  const windowState = getPartyWindow(campaign.id);
+  if (!windowState || windowState.processing || !windowState.actions.length) {
+    return;
+  }
+
+  clearPartyWindowTimer(windowState);
+
+  // Never advance the fiction while the DM is waiting on a roll.
+  if (pendingRollCount(campaign) > 0) {
+    return;
+  }
+
+  if (everyoneInWindowReady(windowState)) {
+    windowState.timer = setTimeout(() => {
+      processPartyActionWindow(campaign.id).catch((err) =>
+        console.error("Immediate ready-window processing error:", err)
+      );
+    }, 50);
+    windowState.deadline = Date.now() + 50;
+    return;
+  }
+
+  windowState.deadline = Date.now() + PARTY_ACTION_WINDOW_MS;
+
+  windowState.timer = setTimeout(() => {
+    processPartyActionWindow(campaign.id).catch((err) =>
+      console.error("Party action-window processing error:", err)
+    );
+  }, PARTY_ACTION_WINDOW_MS);
+}
+
+function addActionToPartyWindow(message, campaign, party) {
+  const character = getCharacter(message.guildId, message.author.id);
+  if (!character) return null;
+
+  const text = cleanPlayerText(message.content);
+  if (!text) return null;
+
+  const windowState = ensurePartyWindow(campaign, message.channel);
+
+  windowState.actions.push({
+    userId: message.author.id,
+    characterName: character.name,
+    text,
+    messageId: message.id,
+    createdAt: Date.now(),
+  });
+
+  windowState.participants.add(message.author.id);
+
+  // If this player says anything after /ready, they are no longer ready.
+  windowState.ready.delete(message.author.id);
+
+  windowState.updatedAt = Date.now();
+
+  schedulePartyWindow(campaign, party, message.channel);
+  return windowState;
+}
+
+function readyStatusDescription(windowState, campaign, party) {
+  const participants = partyWindowParticipants(windowState);
+
+  if (!participants.length) {
+    return "There are no party actions waiting for the Dungeon Master.";
+  }
+
+  const lines = participants.map((userId) => {
+    const character = getCharacter(campaign.guildId, userId);
+    const label = character?.name || `<@${userId}>`;
+    return `${windowState.ready.has(userId) ? "✅" : "⏳"} **${label}**`;
+  });
+
+  if (pendingRollCount(campaign) > 0) {
+    lines.push(
+      "",
+      `🎲 The DM is waiting for **${pendingRollCount(campaign)} unresolved roll${pendingRollCount(campaign) === 1 ? "" : "s"}** before continuing.`
+    );
+  } else {
+    const remaining = partyWindowRemainingSeconds(windowState);
+    lines.push(
+      "",
+      everyoneInWindowReady(windowState)
+        ? "⚡ **Everyone participating is ready. The DM is responding now.**"
+        : `⏱️ DM responds after **20 seconds of silence**${remaining !== null ? ` • about **${remaining}s** remaining` : ""}.`
+    );
+  }
+
+  return lines.join("\n");
+}
+
+async function handleReadyCommand(interaction) {
+  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+
+  if (!party) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "You need to be in a party before using `/ready`.",
+    });
+  }
+
+  const campaign = getActiveCampaignForChannel(
+    interaction.guildId,
+    interaction.channelId
+  );
+
+  if (!campaign || campaign.partyId !== party.id) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "Use `/ready` in your party's active adventure channel.",
+    });
+  }
+
+  const windowState = getPartyWindow(campaign.id);
+
+  if (!windowState || !windowState.actions.length) {
+    return interaction.reply({
+      ephemeral: true,
+      content:
+        "There are no party actions waiting right now. Say what your character does first, then use `/ready`.",
+    });
+  }
+
+  if (!windowState.participants.has(interaction.user.id)) {
+    return interaction.reply({
+      ephemeral: true,
+      content:
+        "Only players who contributed to the current action window need to use `/ready`.",
+    });
+  }
+
+  windowState.ready.add(interaction.user.id);
+  windowState.updatedAt = Date.now();
+
+  schedulePartyWindow(campaign, party, interaction.channel);
+
+  return interaction.reply({
+    content:
+      `⚔️ **Party Ready Check**\n\n` +
+      readyStatusDescription(windowState, campaign, party),
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function aiDMPartyAction(campaign, party, actions) {
+  if (!openai) {
+    return {
+      narration:
+        "⚠️ The AI Dungeon Master is not configured yet. Add `OPENAI_API_KEY` to Railway.",
+      action_type: "none",
+      player_id: "",
+      check_name: "None",
+      ability: "NONE",
+      dc: 0,
+      roll_reason: "",
+      consequences_success: "",
+      consequences_failure: "",
+      image_type: "none",
+      image_prompt: "",
+    };
+  }
+
+  const participants = actions.map((action) => ({
+    playerId: action.userId,
+    characterName: action.characterName,
+    text: action.text,
+  }));
+
+  const input = JSON.stringify(
+    {
+      campaign: {
+        title: campaign.title,
+        mode: campaign.mode,
+        chapter: campaign.chapter,
+        summary: campaign.summary,
+        location: campaign.location,
+      },
+      party: partyMembersContext(party),
+      recentHistory: recentCampaignContext(campaign),
+      partyActions: participants,
+      instruction:
+        "Resolve these party declarations together as one tabletop scene. Respect each player's declared action. Do not invent actions for players. " +
+        "If one meaningful uncertain action needs a roll, request exactly one check for the most appropriate PARTICIPATING player by returning that player's Discord playerId. " +
+        "If multiple players are helping the same task, reflect that help narratively but still request no more than one check in this response. " +
+        "Otherwise narrate the combined result without a check.",
+    },
+    null,
+    2
+  );
+
+  const response = await openai.responses.create({
+    model: OPENAI_MODEL,
+    instructions: DM_INSTRUCTIONS,
+    input,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "discord_dm_party_action",
+        strict: true,
+        schema: dmActionSchema,
+      },
+    },
+  });
+
+  return JSON.parse(response.output_text);
+}
+
+async function processPartyActionWindow(campaignId) {
+  const windowState = getPartyWindow(campaignId);
+  if (!windowState || windowState.processing || !windowState.actions.length) {
+    return;
+  }
+
+  const campaign = data.campaigns[campaignId];
+  if (!campaign || campaign.status !== "active") {
+    clearPartyWindowTimer(windowState);
+    partyActionWindows.delete(campaignId);
+    return;
+  }
+
+  const party = data.parties[campaign.partyId];
+  if (!party) return;
+
+  // Pending check protection: preserve queued actions until the roll resolves.
+  if (pendingRollCount(campaign) > 0) {
+    clearPartyWindowTimer(windowState);
+    return;
+  }
+
+  clearPartyWindowTimer(windowState);
+  windowState.processing = true;
+
+  // Atomically detach the batch so new messages can begin the NEXT window.
+  const actions = [...windowState.actions];
+
+  windowState.actions = [];
+  windowState.participants = new Set();
+  windowState.ready = new Set();
+
+  const channel =
+    windowState.channel ||
+    (await client.channels.fetch(windowState.channelId).catch(() => null));
+
+  try {
+    for (const action of actions) {
+      appendLog(campaign, {
+        type: "player",
+        userId: action.userId,
+        characterName: action.characterName,
+        text: action.text,
+      });
+    }
+
+    if (!channel?.isTextBased()) {
+      throw new Error("Party action-window channel is unavailable.");
+    }
+
+    await channel.sendTyping();
+
+    const result = await aiDMPartyAction(campaign, party, actions);
+
+    appendLog(campaign, {
+      type: "dm",
+      text: result.narration,
+    });
+
+    await sendLong(
+      channel,
+      `🎭 **Dungeon Master**\n\n${result.narration}`
+    );
+
+    await maybeSendAutomaticImage(
+      channel,
+      campaign,
+      party,
+      result
+    );
+
+    const participatingIds = new Set(actions.map((action) => action.userId));
+
+    if (
+      result.action_type === "check" &&
+      participatingIds.has(result.player_id) &&
+      result.check_name !== "None"
+    ) {
+      const targetCharacter = getCharacter(
+        campaign.guildId,
+        result.player_id
+      );
+
+      if (targetCharacter) {
+        const ability =
+          result.ability !== "NONE"
+            ? result.ability
+            : SKILL_TO_ABILITY[result.check_name] || "WIS";
+
+        campaign.pendingChecks ||= {};
+
+        campaign.pendingChecks[result.player_id] = {
+          id: uid(),
+          checkName: result.check_name,
+          ability,
+          dice: "1d20",
+          dc: clamp(result.dc, 5, 30),
+          reason: result.roll_reason,
+          successDirection: result.consequences_success,
+          failureDirection: result.consequences_failure,
+          channelId: campaign.channelId,
+          createdAt: Date.now(),
+        };
+
+        saveDataSoon();
+
+        const pending = campaign.pendingChecks[result.player_id];
+
+        const checkEmbed = new EmbedBuilder()
+          .setTitle(`🎲 ${targetCharacter.name} — Roll Required!`)
+          .setDescription(result.roll_reason || "The outcome is uncertain.")
+          .addFields(
+            {
+              name: "Check",
+              value: result.check_name.replace(/([a-z])([A-Z])/g, "$1 $2"),
+              inline: true,
+            },
+            {
+              name: "Die",
+              value: "🎲 **1d20**",
+              inline: true,
+            },
+            {
+              name: "Modifier",
+              value: `${ability} ${formatModifier(targetCharacter.stats[ability] || 0)}`,
+              inline: true,
+            }
+          )
+          .setFooter({
+            text:
+              "3D Dice is experimental. Reliable fallback: type /roll. The DC is hidden.",
+          });
+
+        await channel.send({
+          embeds: [checkEmbed],
+          components: [make3DDiceButton(pending)],
+          allowedMentions: { parse: [] },
+        });
+
+        await channel.send({
+          content:
+            `🎲 **${targetCharacter.name}:** if the 3D Dice Activity does not work, simply type **\`/roll\`** in this channel. ` +
+            "The bot will automatically use the correct d20 and modifier.",
+          allowedMentions: { parse: [] },
+        });
+      }
+    }
+  } catch (err) {
+    console.error("Party action-window DM error:", err);
+
+    if (channel?.isTextBased()) {
+      await channel.send(
+        "⚠️ **The Dungeon Master hit a snag processing the party's actions.** Your messages were saved. Try another action in a moment."
+      );
+    }
+  } finally {
+    windowState.processing = false;
+
+    // New messages may have arrived while the AI was responding.
+    if (windowState.actions.length) {
+      schedulePartyWindow(campaign, party, channel);
+    } else {
+      partyActionWindows.delete(campaignId);
+    }
+  }
+}
+
+function resumePartyWindowAfterRoll(campaign) {
+  const windowState = getPartyWindow(campaign.id);
+
+  if (!windowState || !windowState.actions.length) return;
+  if (pendingRollCount(campaign) > 0) return;
+
+  const party = data.parties[campaign.partyId];
+  if (!party) return;
+
+  schedulePartyWindow(campaign, party, windowState.channel);
 }
 
 // ============================================================
@@ -2485,6 +2949,10 @@ async function handleRollCommand(interaction) {
       "⚠️ The roll was saved correctly, but the Dungeon Master's follow-up narration failed."
     );
   }
+
+  // Any actions declared by other party members while this roll was pending
+  // may now begin their normal 20-second multiplayer window.
+  resumePartyWindowAfterRoll(campaign);
 }
 
 // ============================================================
@@ -2823,6 +3291,10 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName("ready")
+    .setDescription("Mark your current party action as ready for the DM."),
+
+  new SlashCommandBuilder()
     .setName("level")
     .setDescription("View your level, XP, and progression."),
 
@@ -2931,6 +3403,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "roll":
           return handleRollCommand(interaction);
 
+        case "ready":
+          return handleReadyCommand(interaction);
+
         case "level":
           return handleLevelCommand(interaction);
 
@@ -2957,12 +3432,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   "**2.** `/party create` — Make a party and share its code.\n" +
                   "**3.** Friends use `/party join`.\n" +
                   "**4.** Party leader uses `/adventure start`.\n" +
-                  "**5.** Talk normally in the adventure channel to tell the DM what your character does.\n" +
-                  "**6.** When the DM requests a check, use `/roll`.\n" +
-                  "**7.** `/character`, `/inventory`, `/recap`, and `/adventure status` show saved information.\n" +
-                  "**8.** `/level` shows your XP and level progression.\n" +
-                  "**9.** `/askdm question:<your question>` privately asks the DM something without advancing the game.\n" +
-                  "**10.** `/scene` generates the current cinematic scene and `/portrait` creates your character art.\n\n" +
+                  "**5.** Talk normally in the adventure channel. The DM waits **20 seconds after the latest party message** so friends can declare actions together.\n" +
+                  "**6.** `/ready` marks your current action ready. If every participating player is ready, the DM responds immediately.\n" +
+                  "**7.** When the DM requests a check, **`/roll` is the reliable roll command**. The 3D Dice button remains experimental.\n" +
+                  "**8.** `/character`, `/inventory`, `/recap`, and `/adventure status` show saved information.\n" +
+                  "**9.** `/level` shows your XP and level progression.\n" +
+                  "**10.** `/askdm question:<your question>` privately asks the DM something without advancing the game.\n" +
+                  "**11.** `/scene` generates the current cinematic scene and `/portrait` creates your character art.\n\n" +
                   "🎲 You can also roll manual dice with `/roll dice:2d6+3`.\n" +
                   `🖼️ Automatic cinematic images are limited to ${AUTO_IMAGE_LIMIT} per campaign.`
                 ),
@@ -3200,6 +3676,8 @@ async function resolvePhysicalD20({
     );
   }
 
+  resumePartyWindowAfterRoll(campaign);
+
   return {
     ok: true,
     naturalRoll,
@@ -3320,12 +3798,23 @@ client.on(Events.MessageCreate, async (message) => {
   const character = getCharacter(message.guildId, message.author.id);
   if (!character) return;
 
-  // Let players use ordinary chat for out-of-character messages by starting with //
+  // Out-of-character chat: completely ignored by the adventure engine.
   if (message.content.trim().startsWith("//")) return;
 
-  await enqueueCampaign(campaign.id, () =>
-    processPlayerAction(message, campaign, party)
-  );
+  const text = cleanPlayerText(message.content);
+  if (!text) return;
+
+  // A player with their own unresolved check must resolve that check before
+  // declaring another uncertain action. /roll always remains available.
+  if (campaign.pendingChecks?.[message.author.id]) {
+    await message.reply(
+      `🎲 **${character.name} already has a roll waiting.** ` +
+      `Type **\`/roll\`** to resolve it. The 3D Dice Activity is optional while we test it.`
+    );
+    return;
+  }
+
+  addActionToPartyWindow(message, campaign, party);
 });
 
 // ============================================================
@@ -3340,6 +3829,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Image quality: ${OPENAI_IMAGE_QUALITY}`);
   console.log(`AI configured: ${openai ? "YES" : "NO"}`);
   console.log(`3D dice bridge configured: ${DICE_BRIDGE_SECRET ? "YES" : "NO"}`);
+  console.log(`Multiplayer action window: ${PARTY_ACTION_WINDOW_MS / 1000}s`);
 });
 
 process.on("SIGINT", () => {
