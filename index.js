@@ -5122,43 +5122,107 @@ function bridgeAuthorized(req) {
   return supplied.length > 0 && supplied === DICE_BRIDGE_SECRET;
 }
 
-function findBridgePending(guildId, channelId, userId) {
+function findBridgePending(
+  guildId,
+  activityChannelId,
+  userId,
+  expectedPendingId = ""
+) {
   const character = getCharacter(guildId, userId);
   if (!character) return { error: "NO_CHARACTER" };
 
   const party = getPartyByMember(guildId, userId);
   if (!party) return { error: "NO_PARTY" };
 
-  const found = findPendingCheckCampaign(
-    guildId,
-    channelId,
-    party.id,
-    userId
-  );
+  // IMPORTANT:
+  // Discord Activities may run inside a VOICE channel even though the
+  // adventure itself is in a TEXT channel. Therefore activityChannelId
+  // cannot be treated as the authoritative campaign channel.
+  //
+  // First collect every active campaign in this guild/party that has a
+  // pending roll for this exact Discord user.
+  const candidates = Object.values(data.campaigns)
+    .filter(
+      (campaign) =>
+        campaign.guildId === guildId &&
+        campaign.partyId === party.id &&
+        campaign.status === "active" &&
+        campaign.pendingChecks?.[userId]
+    )
+    .map((campaign) => ({
+      campaign,
+      pending: campaign.pendingChecks[userId],
+    }));
 
-  if (!found.campaign || !found.pending) {
+  if (!candidates.length) {
     return { error: "NO_PENDING_ROLL" };
   }
 
-  if (found.campaign.channelId !== channelId) {
-    return { error: "WRONG_CHANNEL" };
+  // If the Activity already knows the unique roll ID, that is the strongest
+  // possible match and prevents an old/stale roll from being submitted.
+  if (expectedPendingId) {
+    const exactPending = candidates.find(
+      ({ pending }) => pending.id === expectedPendingId
+    );
+
+    if (!exactPending) {
+      return { error: "PENDING_ROLL_CHANGED" };
+    }
+
+    return {
+      character,
+      party,
+      campaign: exactPending.campaign,
+      pending: exactPending.pending,
+      activityChannelId,
+    };
   }
+
+  // Prefer the text campaign channel if Discord happens to report it.
+  const exactChannel = candidates.find(
+    ({ campaign }) => campaign.channelId === activityChannelId
+  );
+
+  if (exactChannel) {
+    return {
+      character,
+      party,
+      campaign: exactChannel.campaign,
+      pending: exactChannel.pending,
+      activityChannelId,
+    };
+  }
+
+  // Otherwise choose the newest pending roll for this player. This is the
+  // normal multiplayer/voice-chat case.
+  candidates.sort(
+    (a, b) =>
+      Number(b.pending.createdAt || 0) -
+      Number(a.pending.createdAt || 0)
+  );
 
   return {
     character,
     party,
-    campaign: found.campaign,
-    pending: found.pending,
+    campaign: candidates[0].campaign,
+    pending: candidates[0].pending,
+    activityChannelId,
   };
 }
 
 async function resolvePhysicalD20({
   guildId,
-  channelId,
+  activityChannelId,
   userId,
+  pendingId,
   naturalRoll,
 }) {
-  const found = findBridgePending(guildId, channelId, userId);
+  const found = findBridgePending(
+    guildId,
+    activityChannelId,
+    userId,
+    pendingId
+  );
 
   if (found.error) {
     return { ok: false, error: found.error };
@@ -5214,9 +5278,11 @@ async function resolvePhysicalD20({
 
   saveDataSoon();
 
-  const channel = await client.channels.fetch(channelId);
+  // Always send the outcome to the adventure's REAL text channel.
+  // The Discord Activity itself may be running inside a voice channel.
+  const channel = await client.channels.fetch(campaign.channelId);
   if (!channel?.isTextBased()) {
-    return { ok: false, error: "CHANNEL_UNAVAILABLE" };
+    return { ok: false, error: "CAMPAIGN_CHANNEL_UNAVAILABLE" };
   }
 
   const natText =
@@ -5280,6 +5346,8 @@ async function resolvePhysicalD20({
     outcome,
     characterName: character.name,
     checkName: pending.checkName,
+    campaignChannelId: campaign.channelId,
+    pendingId: pending.id,
   };
 }
 
@@ -5303,13 +5371,13 @@ bridgeApp.post("/dice/pending", (req, res) => {
 
   const { guildId, channelId, userId } = req.body || {};
 
-  if (!guildId || !channelId || !userId) {
+  if (!guildId || !userId) {
     return res.status(400).json({ ok: false, error: "MISSING_FIELDS" });
   }
 
   const found = findBridgePending(
     String(guildId),
-    String(channelId),
+    String(channelId || ""),
     String(userId)
   );
 
@@ -5317,12 +5385,19 @@ bridgeApp.post("/dice/pending", (req, res) => {
     return res.status(404).json({ ok: false, error: found.error });
   }
 
-  const { character, pending } = found;
+  const { character, campaign, pending } = found;
+
+  console.log(
+    `[3D Dice] Pending lookup for ${character.name}: ` +
+    `activityChannel=${channelId || "NONE"} campaignChannel=${campaign.channelId} pending=${pending.id}`
+  );
 
   return res.json({
     ok: true,
     pending: {
       id: pending.id,
+      campaignId: campaign.id,
+      campaignChannelId: campaign.channelId,
       characterName: character.name,
       checkName: pending.checkName,
       dice: pending.dice || "1d20",
@@ -5338,9 +5413,16 @@ bridgeApp.post("/dice/result", async (req, res) => {
     return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
   }
 
-  const { guildId, channelId, userId, die, result } = req.body || {};
+  const {
+    guildId,
+    channelId,
+    userId,
+    pendingId,
+    die,
+    result,
+  } = req.body || {};
 
-  if (!guildId || !channelId || !userId) {
+  if (!guildId || !userId || !pendingId) {
     return res.status(400).json({ ok: false, error: "MISSING_FIELDS" });
   }
 
@@ -5351,8 +5433,9 @@ bridgeApp.post("/dice/result", async (req, res) => {
   try {
     const resolved = await resolvePhysicalD20({
       guildId: String(guildId),
-      channelId: String(channelId),
+      activityChannelId: String(channelId || ""),
       userId: String(userId),
+      pendingId: String(pendingId),
       naturalRoll: Number(result),
     });
 
@@ -5432,6 +5515,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log("Turn-based Combat v1: ENABLED");
   console.log("Character backstory choice: PLAYER-WRITTEN or AI-GENERATED");
   console.log("Backstory modal hotfix v1.7.2: ENABLED");
+  console.log("3D dice multiplayer/voice-channel bridge fix v1.7.3: ENABLED");
 });
 
 process.on("SIGINT", () => {
