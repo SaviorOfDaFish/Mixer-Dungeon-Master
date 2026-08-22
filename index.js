@@ -662,6 +662,7 @@ async function aiDMPartyAction(campaign, party, actions) {
       player_id: "",
       check_name: "None",
       ability: "NONE",
+      roll_mode: "normal",
       dc: 0,
       roll_reason: "",
       consequences_success: "",
@@ -839,6 +840,7 @@ async function processPartyActionWindow(campaignId) {
           checkName: result.check_name,
           ability,
           dice: "1d20",
+          rollMode: normalizeRollMode(result.roll_mode),
           dc: clamp(result.dc, 5, 30),
           reason: result.roll_reason,
           successDirection: result.consequences_success,
@@ -869,6 +871,14 @@ async function processPartyActionWindow(campaignId) {
               name: "Modifier",
               value: `${ability} ${formatModifier(targetCharacter.stats[ability] || 0)}`,
               inline: true,
+            },
+            {
+              name: "Roll Mode",
+              value:
+                `${rollModeEmoji(pending.rollMode)} **${rollModeLabel(pending.rollMode)}**
+` +
+                rollModeInstruction(pending.rollMode),
+              inline: false,
             }
           )
           .setFooter({
@@ -1438,6 +1448,7 @@ async function aiDMCombatTurn(campaign, party, character, playerText) {
       action_kind: "attack",
       check_name: "Attack",
       ability: "STR",
+      roll_mode: "normal",
       target_id: livingEnemies(campaign)[0]?.id || "",
       roll_reason: "Make an attack roll.",
     };
@@ -1469,6 +1480,10 @@ async function aiDMCombatTurn(campaign, party, character, playerText) {
         type: "string",
         enum: ["STR", "DEX", "CON", "INT", "WIS", "CHA", "NONE"],
       },
+      roll_mode: {
+        type: "string",
+        enum: ["normal", "advantage", "disadvantage"],
+      },
       target_id: { type: "string" },
       roll_reason: { type: "string" },
     },
@@ -1477,6 +1492,7 @@ async function aiDMCombatTurn(campaign, party, character, playerText) {
       "action_kind",
       "check_name",
       "ability",
+      "roll_mode",
       "target_id",
       "roll_reason",
     ],
@@ -1495,6 +1511,7 @@ COMBAT TURN RULES:
 - For an offensive spell requiring an attack use SpellAttack.
 - Defend or simple movement may use check_name None.
 - target_id MUST be one of the living enemy IDs supplied, unless the action has no target.
+- Choose roll_mode using the same advantage/disadvantage rules as normal checks. If neither clearly applies, use normal.
 - Keep combat narration short and punchy.
 `,
     input: JSON.stringify(
@@ -1624,6 +1641,7 @@ async function processCombatPlayerMessage(message, campaign, party) {
         checkName: result.check_name,
         ability,
         dice: "1d20",
+        rollMode: normalizeRollMode(result.roll_mode),
         dc: target.ac,
         reason:
           result.roll_reason ||
@@ -1664,6 +1682,14 @@ async function processCombatPlayerMessage(message, campaign, party) {
                 name: "Modifier",
                 value: `${ability} ${formatModifier(character.stats[ability] || 0)}`,
                 inline: true,
+              },
+              {
+                name: "Roll Mode",
+                value:
+                  `${rollModeEmoji(pending.rollMode)} **${rollModeLabel(pending.rollMode)}**
+` +
+                  rollModeInstruction(pending.rollMode),
+                inline: false,
               }
             )
             .setFooter({
@@ -2778,6 +2804,90 @@ ${classInfo?.emoji ? "" : ""}
 }
 
 // ============================================================
+// ADVANTAGE / DISADVANTAGE
+// ============================================================
+
+function normalizeRollMode(mode) {
+  const value = String(mode || "normal").toLowerCase();
+  return ["normal", "advantage", "disadvantage"].includes(value)
+    ? value
+    : "normal";
+}
+
+function rollModeEmoji(mode) {
+  const value = normalizeRollMode(mode);
+  if (value === "advantage") return "🟢";
+  if (value === "disadvantage") return "🔴";
+  return "⚪";
+}
+
+function rollModeLabel(mode) {
+  const value = normalizeRollMode(mode);
+  if (value === "advantage") return "ADVANTAGE";
+  if (value === "disadvantage") return "DISADVANTAGE";
+  return "NORMAL";
+}
+
+function rollModeInstruction(mode) {
+  const value = normalizeRollMode(mode);
+  if (value === "advantage") return "Roll 2d20 and keep the HIGHER result.";
+  if (value === "disadvantage") return "Roll 2d20 and keep the LOWER result.";
+  return "Roll 1d20.";
+}
+
+function resolveD20ModeRoll(mode, suppliedRolls = null) {
+  const value = normalizeRollMode(mode);
+  const needed = value === "normal" ? 1 : 2;
+
+  const rolls = Array.isArray(suppliedRolls)
+    ? suppliedRolls
+        .map(Number)
+        .filter((n) => Number.isInteger(n) && n >= 1 && n <= 20)
+        .slice(0, needed)
+    : Array.from(
+        { length: needed },
+        () => 1 + Math.floor(Math.random() * 20)
+      );
+
+  if (rolls.length !== needed) return null;
+
+  const kept =
+    value === "advantage"
+      ? Math.max(...rolls)
+      : value === "disadvantage"
+        ? Math.min(...rolls)
+        : rolls[0];
+
+  return { mode: value, rolls, kept };
+}
+
+function formatD20ModeResult(result) {
+  if (result.mode === "normal") {
+    return `🎲 Roll: **${result.kept}**`;
+  }
+
+  const target =
+    result.mode === "advantage"
+      ? Math.max(...result.rolls)
+      : Math.min(...result.rolls);
+
+  let marked = false;
+  const shown = result.rolls.map((value) => {
+    if (!marked && value === target) {
+      marked = true;
+      return `**${value} ← kept**`;
+    }
+
+    return String(value);
+  });
+
+  return (
+    `${rollModeEmoji(result.mode)} **${rollModeLabel(result.mode)}**\n` +
+    `🎲 Rolls: ${shown.join(" • ")}`
+  );
+}
+
+// ============================================================
 // AI DM
 // ============================================================
 
@@ -2800,6 +2910,11 @@ RULES:
 - You may REQUEST one check when an uncertain action has meaningful consequences.
 - If no roll is needed, use action_type "none".
 - If a roll is needed, use action_type "check" and select the most suitable check.
+- Every requested d20 check MUST choose roll_mode: "normal", "advantage", or "disadvantage".
+- Advantage requires a meaningful favorable circumstance such as effective help, superior positioning, surprise, or a relevant feature.
+- Disadvantage requires a meaningful hindrance such as poor visibility, awkward positioning, a harmful condition, or a similar obstacle.
+- Difficulty alone does NOT create disadvantage; represent ordinary difficulty with the DC.
+- If advantage and disadvantage both apply, they cancel and roll_mode must be "normal".
 - Use DCs roughly:
   8 easy, 10 routine, 12 moderate, 14 challenging, 16 hard, 18 very hard, 20+ exceptional.
 - Do not reveal the numeric DC in narration.
@@ -2881,6 +2996,10 @@ const dmActionSchema = {
       type: "string",
       enum: ["STR", "DEX", "CON", "INT", "WIS", "CHA", "NONE"],
     },
+    roll_mode: {
+      type: "string",
+      enum: ["normal", "advantage", "disadvantage"],
+    },
     dc: { type: "integer", minimum: 0, maximum: 30 },
     roll_reason: { type: "string" },
     consequences_success: { type: "string" },
@@ -2907,6 +3026,7 @@ const dmActionSchema = {
     "player_id",
     "check_name",
     "ability",
+    "roll_mode",
     "dc",
     "roll_reason",
     "consequences_success",
@@ -2929,6 +3049,7 @@ async function aiDMAction(campaign, party, actingUserId, playerText) {
       player_id: "",
       check_name: "None",
       ability: "NONE",
+      roll_mode: "normal",
       dc: 0,
       roll_reason: "",
       consequences_success: "",
@@ -4265,6 +4386,7 @@ async function processPlayerAction(message, campaign, party) {
         checkName: result.check_name,
         ability,
         dice: "1d20",
+        rollMode: normalizeRollMode(result.roll_mode),
         dc: clamp(result.dc, 5, 30),
         reason: result.roll_reason,
         successDirection: result.consequences_success,
@@ -4293,6 +4415,14 @@ async function processPlayerAction(message, campaign, party) {
             name: "Modifier",
             value: `${ability} ${formatModifier(character.stats[ability] || 0)}`,
             inline: true,
+          },
+          {
+            name: "Roll Mode",
+            value:
+              `${rollModeEmoji(campaign.pendingChecks[message.author.id].rollMode)} **${rollModeLabel(campaign.pendingChecks[message.author.id].rollMode)}**
+` +
+              rollModeInstruction(campaign.pendingChecks[message.author.id].rollMode),
+            inline: false,
           }
         )
         .setFooter({
@@ -4376,24 +4506,29 @@ async function handleRollCommand(interaction) {
     });
   }
 
-  // Pending DM checks specify their own die. Ability/skill/attack checks are
-  // currently 1d20, but storing the expression makes this ready for other
-  // requested roll types later.
   const diceExpression = pending.dice || "1d20";
-  const rolled = rollDice(diceExpression);
 
-  if (!rolled) {
-    console.error("Invalid pending dice expression:", pending);
+  if (diceExpression !== "1d20") {
     return interaction.reply({
       ephemeral: true,
       content:
-        "⚠️ The DM requested a roll, but its dice information is invalid. Your roll was **not** consumed.",
+        "⚠️ This pending check is not a d20 check, so it cannot use advantage/disadvantage yet.",
+    });
+  }
+
+  const modeResult = resolveD20ModeRoll(pending.rollMode);
+
+  if (!modeResult) {
+    return interaction.reply({
+      ephemeral: true,
+      content:
+        "⚠️ The roll mode is invalid. Your pending check was **not** consumed.",
     });
   }
 
   const modifier = character.stats[pending.ability] || 0;
-  const naturalRoll = rolled.rolls[0];
-  const total = rolled.raw + modifier;
+  const naturalRoll = modeResult.kept;
+  const total = naturalRoll + modifier;
   const outcome = total >= pending.dc ? "SUCCESS" : "FAILURE";
 
   // Only consume the pending check AFTER we have a valid roll.
@@ -4406,6 +4541,8 @@ async function handleRollCommand(interaction) {
     checkName: pending.checkName,
     ability: pending.ability,
     dice: diceExpression,
+    rollMode: modeResult.mode,
+    rolls: modeResult.rolls,
     naturalRoll,
     modifier,
     total,
@@ -4444,7 +4581,7 @@ async function handleRollCommand(interaction) {
     content:
       `🎲 **${character.name} — ${pending.checkName.replace(/([a-z])([A-Z])/g, "$1 $2")}**\n` +
       `Required Die: **${diceExpression}**\n` +
-      `Natural Roll: **${naturalRoll}**\n` +
+      `${formatD20ModeResult(modeResult)}\n` +
       `${pending.ability}: **${formatModifier(modifier)}**\n` +
       `Total: **${total}**${natText}\n\n` +
       `${resultEmoji} **${outcome}**` +
@@ -5216,6 +5353,7 @@ async function resolvePhysicalD20({
   userId,
   pendingId,
   naturalRoll,
+  rolls,
 }) {
   const found = findBridgePending(
     guildId,
@@ -5234,9 +5372,17 @@ async function resolvePhysicalD20({
     return { ok: false, error: "UNSUPPORTED_DIE" };
   }
 
-  if (!Number.isInteger(naturalRoll) || naturalRoll < 1 || naturalRoll > 20) {
+  const modeResult = resolveD20ModeRoll(
+    pending.rollMode,
+    Array.isArray(rolls) && rolls.length ? rolls : [naturalRoll]
+  );
+
+  if (!modeResult) {
     return { ok: false, error: "INVALID_RESULT" };
   }
+
+  // The server independently chooses which physical die counts.
+  naturalRoll = modeResult.kept;
 
   // Consume before AI narration so a duplicate HTTP request cannot resolve twice.
   delete campaign.pendingChecks[userId];
@@ -5253,6 +5399,8 @@ async function resolvePhysicalD20({
     checkName: pending.checkName,
     ability: pending.ability,
     dice: pending.dice || "1d20",
+    rollMode: modeResult.mode,
+    rolls: modeResult.rolls,
     naturalRoll,
     modifier,
     total,
@@ -5297,7 +5445,8 @@ async function resolvePhysicalD20({
   await channel.send({
     content:
       `🎲 **${character.name} — ${pending.checkName.replace(/([a-z])([A-Z])/g, "$1 $2")}**\n` +
-      `3D Physical Roll: **${naturalRoll}**\n` +
+      `${formatD20ModeResult(modeResult)}\n` +
+      `Source: **3D Physical Dice**\n` +
       `${pending.ability}: **${formatModifier(modifier)}**\n` +
       `Total: **${total}**${natText}\n\n` +
       `${resultEmoji} **${outcome}**` +
@@ -5341,6 +5490,8 @@ async function resolvePhysicalD20({
   return {
     ok: true,
     naturalRoll,
+    rolls: modeResult.rolls,
+    rollMode: modeResult.mode,
     modifier,
     total,
     outcome,
@@ -5401,6 +5552,7 @@ bridgeApp.post("/dice/pending", (req, res) => {
       characterName: character.name,
       checkName: pending.checkName,
       dice: pending.dice || "1d20",
+      rollMode: normalizeRollMode(pending.rollMode),
       ability: pending.ability,
       modifier: character.stats[pending.ability] || 0,
       reason: pending.reason || "",
@@ -5420,6 +5572,7 @@ bridgeApp.post("/dice/result", async (req, res) => {
     pendingId,
     die,
     result,
+    rolls,
   } = req.body || {};
 
   if (!guildId || !userId || !pendingId) {
@@ -5437,6 +5590,7 @@ bridgeApp.post("/dice/result", async (req, res) => {
       userId: String(userId),
       pendingId: String(pendingId),
       naturalRoll: Number(result),
+      rolls: Array.isArray(rolls) ? rolls.map(Number) : [],
     });
 
     if (!resolved.ok) {
@@ -5516,6 +5670,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log("Character backstory choice: PLAYER-WRITTEN or AI-GENERATED");
   console.log("Backstory modal hotfix v1.7.2: ENABLED");
   console.log("3D dice multiplayer/voice-channel bridge fix v1.7.3: ENABLED");
+  console.log("Advantage / Disadvantage v1.7.4: ENABLED");
 });
 
 process.on("SIGINT", () => {
