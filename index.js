@@ -3600,14 +3600,29 @@ async function finalizeCharacterCreation(interaction, draft, key) {
 }
 
 async function handleCharacterBackstoryModal(interaction) {
-  const [prefix, mode, ownerId] =
-    interaction.customId.split(":");
+  // Modal IDs are:
+  //   cc_backstory_custom:<userId>
+  //   cc_backstory_ai:<userId>
+  //
+  // v1.7 incorrectly split these IDs as if they were
+  // "cc_backstory:<mode>:<userId>", which made BOTH backstory
+  // options fail the owner/mode check.
+  const [modalId, ownerId] = interaction.customId.split(":");
 
-  if (
-    prefix !== "cc_backstory" ||
-    interaction.user.id !== ownerId
-  ) {
-    return;
+  let mode = null;
+
+  if (modalId === "cc_backstory_custom") {
+    mode = "custom";
+  } else if (modalId === "cc_backstory_ai") {
+    mode = "ai";
+  }
+
+  if (!mode || interaction.user.id !== ownerId) {
+    return interaction.reply({
+      ephemeral: true,
+      content:
+        "⚠️ I couldn't match this backstory form to your character-creation session. Please run `/createcharacter` again.",
+    });
   }
 
   const key = sessionKey(
@@ -4270,153 +4285,6 @@ async function processPlayerAction(message, campaign, party) {
 }
 
 // ============================================================
-// MANUAL 3D DICE
-// ============================================================
-
-const SUPPORTED_3D_DICE = {
-  d4: 4,
-  d6: 6,
-  d8: 8,
-  d10: 10,
-  d12: 12,
-  d20: 20,
-  d100: 100,
-};
-
-function normalize3DDie(value) {
-  const key = String(value || "").trim().toLowerCase();
-  return SUPPORTED_3D_DICE[key] ? key : null;
-}
-
-function parse3DDiceExpression(expression) {
-  const match = String(expression || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .match(/^(\d{0,2})d(4|6|8|10|12|20|100)([+-]\d{1,2})?$/);
-
-  if (!match) return null;
-
-  const count = Math.max(1, Number(match[1] || 1));
-  const die = `d${match[2]}`;
-  const sides = SUPPORTED_3D_DICE[die];
-  const modifier = Number(match[3] || 0);
-  const physicalCount = count * (die === "d100" ? 2 : 1);
-
-  if (!sides) return null;
-  if (count < 1 || physicalCount > 10) return null;
-  if (modifier < -99 || modifier > 99) return null;
-
-  return {
-    count,
-    die,
-    sides,
-    modifier,
-    physicalCount,
-    expression:
-      `${count}${die}` +
-      (modifier === 0
-        ? ""
-        : modifier > 0
-          ? `+${modifier}`
-          : `${modifier}`),
-  };
-}
-
-function singleDieFromExpression(expression) {
-  const parsed = parse3DDiceExpression(expression);
-  if (!parsed || parsed.count !== 1 || parsed.modifier !== 0) return null;
-  return parsed;
-}
-
-async function handle3DRollCommand(interaction) {
-  const character = getCharacter(
-    interaction.guildId,
-    interaction.user.id
-  );
-
-  if (!character) {
-    return interaction.reply({
-      ephemeral: true,
-      content: "Create a character first with `/createcharacter`.",
-    });
-  }
-
-  const party = getPartyByMember(
-    interaction.guildId,
-    interaction.user.id
-  );
-
-  if (!party) {
-    return interaction.reply({
-      ephemeral: true,
-      content: "Join a party before using the Discord 3D dice table.",
-    });
-  }
-
-  const campaign = getActiveCampaignForChannel(
-    interaction.guildId,
-    interaction.channelId
-  );
-
-  if (!campaign || campaign.partyId !== party.id) {
-    return interaction.reply({
-      ephemeral: true,
-      content:
-        "Use `/3droll` in your party's active adventure channel so the Activity can return the roll here.",
-    });
-  }
-
-  if (campaign.pendingChecks?.[interaction.user.id]) {
-    return interaction.reply({
-      ephemeral: true,
-      content:
-        "🎲 You already have a pending DM roll. Resolve that one first with its 3D button or `/roll`.",
-    });
-  }
-
-  const rollSpec = parse3DDiceExpression(
-    interaction.options.getString("dice", true)
-  );
-
-  if (!rollSpec) {
-    return interaction.reply({
-      ephemeral: true,
-      content:
-        "That 3D dice expression isn't supported. Try `d20`, `2d6`, `3d8+2`, or `4d10`. Maximum: **10 physical dice** (D100 uses two physical dice each).",
-    });
-  }
-
-  campaign.pendingChecks ||= {};
-
-  const pending = {
-    id: uid(),
-    checkName: `Manual ${rollSpec.expression.toUpperCase()} Roll`,
-    ability: "NONE",
-    dice: rollSpec.expression,
-    dc: 0,
-    reason: `${character.name} is making a physical ${rollSpec.expression.toUpperCase()} roll.`,
-    successDirection: "",
-    failureDirection: "",
-    channelId: interaction.channelId,
-    createdAt: Date.now(),
-    manual3D: true,
-    noCheckXP: true,
-  };
-
-  campaign.pendingChecks[interaction.user.id] = pending;
-  saveDataSoon();
-
-  return interaction.reply({
-    content:
-      `🎲 **${character.name} — ${die.toUpperCase()} ready!**\n` +
-      `Launch the 3D Dice Table and physically roll the **${die.toUpperCase()}**.`,
-    components: [make3DDiceButton(pending)],
-    allowedMentions: { parse: [] },
-  });
-}
-
-// ============================================================
 // ROLLS
 // ============================================================
 
@@ -4951,17 +4819,6 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
-    .setName("3droll")
-    .setDescription("Roll one or more physical dice in the Discord 3D Dice Activity.")
-    .addStringOption((o) =>
-      o
-        .setName("dice")
-        .setDescription("Dice expression, e.g. d20, 2d6, 3d8+2, 4d10")
-        .setRequired(true)
-        .setMaxLength(20)
-    ),
-
-  new SlashCommandBuilder()
     .setName("ready")
     .setDescription("Mark your current party action as ready for the DM."),
 
@@ -5095,9 +4952,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "roll":
           return handleRollCommand(interaction);
 
-        case "3droll":
-          return handle3DRollCommand(interaction);
-
         case "ready":
           return handleReadyCommand(interaction);
 
@@ -5143,7 +4997,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   "**12.** `/askdm question:<your question>` privately asks the DM something without advancing the game.\n" +
                   "**13.** `/scene` generates the current cinematic scene and `/portrait` creates your character art.\n\n" +
                   "🎲 You can also roll manual dice with `/roll dice:2d6+3`.\n" +
-                  "🎲 Use `/3droll dice:2d6`, `/3droll dice:3d8+2`, etc. for physical multi-dice rolls in the Discord Activity.\n" +
                   `🖼️ Automatic cinematic images are limited to ${AUTO_IMAGE_LIMIT} per campaign.`
                 ),
             ],
@@ -5271,22 +5124,13 @@ function findBridgePending(guildId, channelId, userId) {
   };
 }
 
-async function resolvePhysicalDie({
+async function resolvePhysicalD20({
   guildId,
   channelId,
   userId,
-  die,
   naturalRoll,
-  results = null,
-  submittedDice = "",
-  submittedModifier = 0,
-  submittedTotal = null,
 }) {
-  const found = findBridgePending(
-    guildId,
-    channelId,
-    userId
-  );
+  const found = findBridgePending(guildId, channelId, userId);
 
   if (found.error) {
     return { ok: false, error: found.error };
@@ -5294,154 +5138,20 @@ async function resolvePhysicalDie({
 
   const { character, party, campaign, pending } = found;
 
-  const pendingSpec = parse3DDiceExpression(
-    pending.dice || "1d20"
-  );
-
-  if (!pendingSpec) {
-    return { ok: false, error: "UNSUPPORTED_DIE_EXPRESSION" };
+  if ((pending.dice || "1d20") !== "1d20") {
+    return { ok: false, error: "UNSUPPORTED_DIE" };
   }
 
-  const submittedDie = normalize3DDie(die);
-
-  if (!submittedDie || submittedDie !== pendingSpec.die) {
-    return {
-      ok: false,
-      error: "WRONG_DIE",
-      expected: pendingSpec.die,
-    };
-  }
-
-  const submittedResults = Array.isArray(results)
-    ? results.map(Number)
-    : [Number(naturalRoll)];
-
-  if (submittedResults.length !== pendingSpec.count) {
-    return {
-      ok: false,
-      error: "WRONG_DICE_COUNT",
-      expected: pendingSpec.count,
-    };
-  }
-
-  const validResult = submittedResults.every(
-    (value) =>
-      Number.isInteger(value) &&
-      value >= 1 &&
-      value <= pendingSpec.sides
-  );
-
-  if (!validResult) {
+  if (!Number.isInteger(naturalRoll) || naturalRoll < 1 || naturalRoll > 20) {
     return { ok: false, error: "INVALID_RESULT" };
   }
 
-  const subtotal = submittedResults.reduce((sum, value) => sum + value, 0);
-  const expectedTotal = subtotal + pendingSpec.modifier;
-
-  if (
-    submittedTotal !== null &&
-    Number(submittedTotal) !== expectedTotal
-  ) {
-    return { ok: false, error: "TOTAL_MISMATCH" };
-  }
-
-  naturalRoll = pendingSpec.count === 1
-    ? submittedResults[0]
-    : expectedTotal;
-
-  // Consume before posting so duplicate Activity submissions cannot resolve twice.
+  // Consume before AI narration so a duplicate HTTP request cannot resolve twice.
   delete campaign.pendingChecks[userId];
 
-  const channel = await client.channels.fetch(channelId);
-
-  if (!channel?.isTextBased()) {
-    return {
-      ok: false,
-      error: "CHANNEL_UNAVAILABLE",
-    };
-  }
-
-  // /3droll is a pure physical roll: no hidden DC and no AI story advancement.
-  if (pending.manual3D) {
-    const rollRecord = {
-      type: "roll",
-      source: "3d_activity_manual",
-      userId,
-      characterName: character.name,
-      checkName: pending.checkName,
-      ability: "NONE",
-      dice: pending.dice,
-      results: submittedResults,
-      subtotal,
-      modifier: pendingSpec.modifier,
-      naturalRoll:
-        pendingSpec.count === 1
-          ? submittedResults[0]
-          : null,
-      total: expectedTotal,
-      outcome: "ROLLED",
-    };
-
-    appendLog(campaign, rollRecord);
-    saveDataSoon();
-
-    const individualText =
-      submittedResults.length > 1
-        ? `Individual Dice: **${submittedResults.join(", ")}**\n`
-        : "";
-
-    const mathText =
-      pendingSpec.modifier === 0
-        ? submittedResults.length > 1
-          ? `${submittedResults.join(" + ")} = **${expectedTotal}**`
-          : `Physical Result: **${expectedTotal}**`
-        : `${submittedResults.join(" + ")} ${
-            pendingSpec.modifier > 0 ? "+" : "-"
-          } ${Math.abs(pendingSpec.modifier)} = **${expectedTotal}**`;
-
-    await channel.send({
-      content:
-        `🎲 **${character.name} rolled ${pendingSpec.expression.toUpperCase()} in 3D!**\n` +
-        individualText +
-        `${mathText}`,
-      allowedMentions: { parse: [] },
-    });
-
-    resumePartyWindowAfterRoll(campaign);
-
-    return {
-      ok: true,
-      results: submittedResults,
-      subtotal,
-      modifier: pendingSpec.modifier,
-      naturalRoll:
-        pendingSpec.count === 1
-          ? submittedResults[0]
-          : null,
-      total: expectedTotal,
-      outcome: "ROLLED",
-      characterName: character.name,
-      checkName: pending.checkName,
-      die: pendingSpec.die,
-      dice: pendingSpec.expression,
-    };
-  }
-
-  // Core DM checks currently expect one physical die.
-  if (pendingSpec.count !== 1) {
-    return { ok: false, error: "MULTIDICE_CHECK_UNSUPPORTED" };
-  }
-
-  const modifier =
-    pending.ability && pending.ability !== "NONE"
-      ? character.stats[pending.ability] || 0
-      : 0;
-
+  const modifier = character.stats[pending.ability] || 0;
   const total = naturalRoll + modifier;
-  const outcome =
-    total >= Number(pending.dc || 0)
-      ? "SUCCESS"
-      : "FAILURE";
+  const outcome = total >= pending.dc ? "SUCCESS" : "FAILURE";
 
   const rollRecord = {
     type: "roll",
@@ -5459,44 +5169,42 @@ async function resolvePhysicalDie({
 
   appendLog(campaign, rollRecord);
 
-  const isD20 = pendingSpec.die === "d20";
-
   const xpAmount =
     pending.noCheckXP
       ? 0
       : outcome === "SUCCESS"
-        ? 10 + (isD20 && naturalRoll === 20 ? 5 : 0)
+        ? 10 + (naturalRoll === 20 ? 5 : 0)
         : 0;
 
   const xpProgression = awardCharacterXP(
     character,
     xpAmount,
-    isD20 && naturalRoll === 20
+    naturalRoll === 20
       ? `${pending.checkName} success + Natural 20`
       : `${pending.checkName} success`
   );
 
   saveDataSoon();
 
+  const channel = await client.channels.fetch(channelId);
+  if (!channel?.isTextBased()) {
+    return { ok: false, error: "CHANNEL_UNAVAILABLE" };
+  }
+
   const natText =
-    isD20 && naturalRoll === 20
+    naturalRoll === 20
       ? "\n🌟 **NATURAL 20!**"
-      : isD20 && naturalRoll === 1
+      : naturalRoll === 1
         ? "\n💀 **NATURAL 1!**"
         : "";
 
-  const resultEmoji =
-    outcome === "SUCCESS"
-      ? "✅"
-      : "❌";
+  const resultEmoji = outcome === "SUCCESS" ? "✅" : "❌";
 
   await channel.send({
     content:
       `🎲 **${character.name} — ${pending.checkName.replace(/([a-z])([A-Z])/g, "$1 $2")}**\n` +
-      `Physical ${pendingSpec.die.toUpperCase()} Roll: **${naturalRoll}**\n` +
-      (pending.ability && pending.ability !== "NONE"
-        ? `${pending.ability}: **${formatModifier(modifier)}**\n`
-        : "") +
+      `3D Physical Roll: **${naturalRoll}**\n` +
+      `${pending.ability}: **${formatModifier(modifier)}**\n` +
       `Total: **${total}**${natText}\n\n` +
       `${resultEmoji} **${outcome}**` +
       (xpProgression.gained
@@ -5507,35 +5215,14 @@ async function resolvePhysicalDie({
 
   if (xpProgression.levelUps.length) {
     await channel.send({
-      embeds: [
-        levelUpEmbed(
-          character,
-          xpProgression
-        ),
-      ],
+      embeds: [levelUpEmbed(character, xpProgression)],
       allowedMentions: { parse: [] },
     });
   }
 
-  if (pending.combatAttack) {
-    // The existing combat resolver expects an interaction object, so the
-    // current physical combat attack path remains d20-only through its
-    // existing Activity logic. Normal story checks continue below.
-    // v1.8 focuses additional dice on /3droll and generic future checks.
-  }
-
   try {
-    const resolved = await aiResolveCheck(
-      campaign,
-      party,
-      rollRecord,
-      pending
-    );
-
-    appendLog(campaign, {
-      type: "dm",
-      text: resolved.narration,
-    });
+    const resolved = await aiResolveCheck(campaign, party, rollRecord, pending);
+    appendLog(campaign, { type: "dm", text: resolved.narration });
 
     await sendLong(
       channel,
@@ -5548,27 +5235,8 @@ async function resolvePhysicalDie({
       party,
       resolved
     );
-
-    recordScenePacing(
-      campaign,
-      resolved.scene_mode || "action"
-    );
-
-    if (
-      resolved.scene_mode === "downtime"
-    ) {
-      await sendDowntimeBanner(
-        channel,
-        campaign,
-        "That moment of tension passes, leaving the party some breathing room."
-      );
-    }
   } catch (err) {
-    console.error(
-      "3D roll narration error:",
-      err
-    );
-
+    console.error("3D roll narration error:", err);
     await channel.send(
       "⚠️ The 3D roll was saved correctly, but the Dungeon Master's follow-up narration failed."
     );
@@ -5584,7 +5252,6 @@ async function resolvePhysicalDie({
     outcome,
     characterName: character.name,
     checkName: pending.checkName,
-    die: pendingSpec.die,
   };
 }
 
@@ -5632,10 +5299,7 @@ bridgeApp.post("/dice/pending", (req, res) => {
       checkName: pending.checkName,
       dice: pending.dice || "1d20",
       ability: pending.ability,
-      modifier:
-        pending.ability && pending.ability !== "NONE"
-          ? character.stats[pending.ability] || 0
-          : 0,
+      modifier: character.stats[pending.ability] || 0,
       reason: pending.reason || "",
     },
   });
@@ -5646,45 +5310,22 @@ bridgeApp.post("/dice/result", async (req, res) => {
     return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
   }
 
-  const {
-    guildId,
-    channelId,
-    userId,
-    die,
-    dice,
-    result,
-    results,
-    modifier,
-    total,
-  } = req.body || {};
+  const { guildId, channelId, userId, die, result } = req.body || {};
 
   if (!guildId || !channelId || !userId) {
     return res.status(400).json({ ok: false, error: "MISSING_FIELDS" });
   }
 
-  const submittedDie = normalize3DDie(die);
-
-  if (!submittedDie) {
-    return res.status(400).json({
-      ok: false,
-      error: "UNSUPPORTED_DIE",
-    });
+  if (String(die || "").toLowerCase() !== "d20") {
+    return res.status(400).json({ ok: false, error: "UNSUPPORTED_DIE" });
   }
 
   try {
-    const resolved = await resolvePhysicalDie({
+    const resolved = await resolvePhysicalD20({
       guildId: String(guildId),
       channelId: String(channelId),
       userId: String(userId),
-      die: submittedDie,
       naturalRoll: Number(result),
-      results,
-      submittedDice: String(dice || ""),
-      submittedModifier: Number(modifier || 0),
-      submittedTotal:
-        total === undefined || total === null
-          ? null
-          : Number(total),
     });
 
     if (!resolved.ok) {
@@ -5762,7 +5403,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Downtime target: after ${DOWNTIME_AFTER_ACTION_BEATS} action beats when safe`);
   console.log("Turn-based Combat v1: ENABLED");
   console.log("Character backstory choice: PLAYER-WRITTEN or AI-GENERATED");
-  console.log("3D dice set: D4 D6 D8 D10 D12 D20 D100");
+  console.log("Backstory modal hotfix v1.7.1: ENABLED");
 });
 
 process.on("SIGINT", () => {
