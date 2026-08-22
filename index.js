@@ -3147,10 +3147,22 @@ async function aiResolveCheck(campaign, party, rollRecord, pending) {
 }
 
 async function aiCharacterStory(draft) {
+  const playerBackstory = String(draft.backstoryText || "").trim();
+  const backstoryMode = draft.backstoryMode || "ai";
+
   if (!openai) {
+    if (backstoryMode === "custom" && playerBackstory) {
+      return {
+        backstory: playerBackstory,
+        secret:
+          "You possess a strange old token whose origin you cannot explain. It sometimes grows warm near ancient magic.",
+      };
+    }
+
     return {
       backstory:
         `${draft.name} became an adventurer after leaving behind a life as a ${draft.background.toLowerCase()}. ` +
+        `${playerBackstory ? `Their story began with this idea: ${playerBackstory}. ` : ""}` +
         `Their journey is driven by one purpose: ${draft.goal}. Their fear of ${draft.fear} is never far away, ` +
         `and companions quickly learn one peculiar truth: ${draft.quirk}.`,
       secret:
@@ -3168,17 +3180,56 @@ async function aiCharacterStory(draft) {
     required: ["backstory", "secret"],
   };
 
+  const instructions =
+    backstoryMode === "custom"
+      ? `
+You are helping finalize a fantasy tabletop RPG character.
+
+The player has written their OWN backstory.
+RULES:
+- Preserve the player's backstory faithfully.
+- Do NOT rewrite, replace, contradict, shorten, or embellish their backstory.
+- Return their supplied backstory as the backstory field.
+- Create one private secret in 1-3 sentences that fits naturally with the supplied character and backstory.
+- The secret is a future story hook, not a mechanical advantage.
+- Do not decide future plot outcomes.
+- Keep the secret suitable for a general gaming community.
+`
+      : `
+You create concise fantasy RPG character hooks for a Discord campaign.
+
+The player has supplied a GENERAL BACKSTORY IDEA rather than a finished story.
+RULES:
+- Write a polished 120-200 word fantasy backstory.
+- Use the player's supplied backstory idea as the foundation.
+- Incorporate the character's ancestry, class, background, goal, fear, and personality quirk naturally.
+- Do not erase or contradict details the player supplied.
+- Give the character at least one meaningful past relationship, place, event, or unresolved thread the DM can reference later.
+- Do not decide future plot outcomes.
+- Then create one private secret in 1-3 sentences.
+- The secret should be a future story hook, not a mechanical advantage.
+- Keep it suitable for a general gaming community.
+`;
+
   const response = await openai.responses.create({
     model: OPENAI_MODEL,
-    instructions: `
-You create concise fantasy RPG character hooks for a Discord campaign.
-Write a 90-160 word backstory using the player's supplied details.
-Then create one private secret in 1-3 sentences.
-The secret should be a future story hook, not a mechanical advantage.
-Do not decide future plot outcomes.
-Keep it suitable for a general gaming community.
-`,
-    input: JSON.stringify(draft, null, 2),
+    instructions,
+    input: JSON.stringify(
+      {
+        name: draft.name,
+        ancestry: draft.ancestry,
+        className: draft.className,
+        background: draft.background,
+        appearance: draft.appearance,
+        goal: draft.goal,
+        fear: draft.fear,
+        quirk: draft.quirk,
+        backstoryMode,
+        playerBackstoryOrIdea: playerBackstory,
+      },
+      null,
+      2
+    ),
     text: {
       format: {
         type: "json_schema",
@@ -3189,7 +3240,15 @@ Keep it suitable for a general gaming community.
     },
   });
 
-  return JSON.parse(response.output_text);
+  const story = JSON.parse(response.output_text);
+
+  // Custom mode is player-owned text. Even if the model tries to alter it,
+  // the application code keeps the player's exact backstory.
+  if (backstoryMode === "custom" && playerBackstory) {
+    story.backstory = playerBackstory;
+  }
+
+  return story;
 }
 
 // ============================================================
@@ -3291,6 +3350,74 @@ function createLoadoutMenu(userId, className) {
   return new ActionRowBuilder().addComponents(menu);
 }
 
+function createBackstoryModeMenu(userId) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`cc_backstory:${userId}`)
+    .setPlaceholder("How would you like to create your backstory?")
+    .addOptions([
+      {
+        label: "I already have my backstory",
+        value: "custom",
+        emoji: "📖",
+        description: "Type your own backstory exactly as you want it saved.",
+      },
+      {
+        label: "Build one from my idea",
+        value: "ai",
+        emoji: "✨",
+        description: "Give the AI a general idea and it will write the full backstory.",
+      },
+    ]);
+
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+function createCustomBackstoryModal(userId) {
+  const modal = new ModalBuilder()
+    .setCustomId(`cc_backstory_custom:${userId}`)
+    .setTitle("Write Your Backstory");
+
+  const backstory = new TextInputBuilder()
+    .setCustomId("backstory")
+    .setLabel("Your character's backstory")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMinLength(20)
+    .setMaxLength(3000)
+    .setPlaceholder(
+      "Paste or write your character's backstory here. The bot will save it exactly as you write it."
+    );
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(backstory)
+  );
+
+  return modal;
+}
+
+function createAIBackstoryIdeaModal(userId) {
+  const modal = new ModalBuilder()
+    .setCustomId(`cc_backstory_ai:${userId}`)
+    .setTitle("Create My Backstory");
+
+  const idea = new TextInputBuilder()
+    .setCustomId("backstory_idea")
+    .setLabel("Give the AI your general backstory idea")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMinLength(10)
+    .setMaxLength(1000)
+    .setPlaceholder(
+      "Example: I grew up in a ruined mining town. My older brother disappeared after finding something beneath the mountain."
+    );
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(idea)
+  );
+
+  return modal;
+}
+
 async function startCharacterCreation(interaction) {
   const existing = getCharacter(interaction.guildId, interaction.user.id);
 
@@ -3361,6 +3488,8 @@ async function handleCharacterDetails(interaction) {
     background: null,
     statStyle: null,
     loadout: null,
+    backstoryMode: null,
+    backstoryText: "",
   };
 
   creationSessions.set(sessionKey(interaction.guildId, interaction.user.id), draft);
@@ -3369,9 +3498,165 @@ async function handleCharacterDetails(interaction) {
     ephemeral: true,
     content:
       `🧙 **Creating ${draft.name}**\n\n` +
-      `**Step 1/5 — Choose your ancestry.**`,
+      `**Step 1/6 — Choose your ancestry.**`,
     components: [createAncestryMenu(interaction.user.id)],
   });
+}
+
+async function finalizeCharacterCreation(interaction, draft, key) {
+  await interaction.reply({
+    ephemeral: true,
+    content:
+      draft.backstoryMode === "custom"
+        ? `✨ **Finishing ${draft.name}...**\nSaving your backstory and creating your private character secret.`
+        : `✨ **Finishing ${draft.name}...**\nThe AI is writing your backstory and creating your private character secret.`,
+  });
+
+  try {
+    const story = await aiCharacterStory(draft);
+    const classData = CLASS_DATA[draft.className];
+    const stats = statsForClass(draft.className, draft.statStyle);
+    const inventory = [...classData.loadouts[draft.loadout]];
+
+    const character = {
+      id: uid(),
+      guildId: interaction.guildId,
+      userId: interaction.user.id,
+      name: draft.name,
+      ancestry: draft.ancestry,
+      className: draft.className,
+      background: draft.background,
+      appearance: draft.appearance,
+      goal: draft.goal,
+      fear: draft.fear,
+      quirk: draft.quirk,
+      secret: story.secret,
+      backstory: story.backstory,
+      backstorySource: draft.backstoryMode === "custom" ? "player" : "ai",
+      backstoryIdea:
+        draft.backstoryMode === "ai"
+          ? draft.backstoryText
+          : "",
+      statStyle: draft.statStyle,
+      stats,
+      level: 1,
+      xp: 0,
+      levelUpHistory: [],
+      hp: classData.baseHp,
+      maxHp: classData.baseHp,
+      ac: classData.ac,
+      gold: 10,
+      inventory,
+      abilities: [...classData.abilities],
+      spells: [...(classData.spells || [])],
+      conditions: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    setCharacter(
+      interaction.guildId,
+      interaction.user.id,
+      character
+    );
+
+    creationSessions.delete(key);
+
+    await interaction.followUp({
+      ephemeral: true,
+      content:
+        character.backstorySource === "player"
+          ? "📖 **Your backstory was saved exactly as you wrote it.**"
+          : "✨ **The AI created your backstory from your idea.**",
+      embeds: [
+        makeCharacterEmbed(
+          character,
+          interaction.user.username
+        ),
+      ],
+    });
+
+    const secretEmbed = new EmbedBuilder()
+      .setTitle(`🔒 ${character.name}'s Private Secret`)
+      .setDescription(character.secret)
+      .setFooter({
+        text:
+          "The AI DM knows this. Other players do not.",
+      });
+
+    await interaction.followUp({
+      ephemeral: true,
+      embeds: [secretEmbed],
+    });
+  } catch (err) {
+    console.error("Character finalization error:", err);
+
+    await interaction.followUp({
+      ephemeral: true,
+      content:
+        "❌ I couldn't finish the character. Your creation session is still available; try submitting the backstory again.",
+    });
+  }
+}
+
+async function handleCharacterBackstoryModal(interaction) {
+  const [prefix, mode, ownerId] =
+    interaction.customId.split(":");
+
+  if (
+    prefix !== "cc_backstory" ||
+    interaction.user.id !== ownerId
+  ) {
+    return;
+  }
+
+  const key = sessionKey(
+    interaction.guildId,
+    interaction.user.id
+  );
+
+  const draft = creationSessions.get(key);
+
+  if (!draft) {
+    return interaction.reply({
+      ephemeral: true,
+      content:
+        "⚠️ This character-creation session expired. Run `/createcharacter` again.",
+    });
+  }
+
+  if (!draft.loadout) {
+    return interaction.reply({
+      ephemeral: true,
+      content:
+        "⚠️ Finish the earlier character-creation steps first.",
+    });
+  }
+
+  if (mode === "custom") {
+    draft.backstoryMode = "custom";
+    draft.backstoryText = interaction.fields
+      .getTextInputValue("backstory")
+      .trim();
+  } else if (mode === "ai") {
+    draft.backstoryMode = "ai";
+    draft.backstoryText = interaction.fields
+      .getTextInputValue("backstory_idea")
+      .trim();
+  } else {
+    return interaction.reply({
+      ephemeral: true,
+      content: "⚠️ Unknown backstory option.",
+    });
+  }
+
+  creationSessions.set(key, draft);
+
+  return finalizeCharacterCreation(
+    interaction,
+    draft,
+    key
+  );
 }
 
 async function handleCharacterSelect(interaction) {
@@ -3401,7 +3686,7 @@ async function handleCharacterSelect(interaction) {
       content:
         `🧙 **Creating ${draft.name}**\n\n` +
         `✅ Ancestry: **${draft.ancestry}**\n\n` +
-        `**Step 2/5 — Choose your class.**`,
+        `**Step 2/6 — Choose your class.**`,
       components: [createClassMenu(interaction.user.id)],
     });
   }
@@ -3413,7 +3698,7 @@ async function handleCharacterSelect(interaction) {
         `🧙 **Creating ${draft.name}**\n\n` +
         `✅ Ancestry: **${draft.ancestry}**\n` +
         `✅ Class: **${draft.className}**\n\n` +
-        `**Step 3/5 — Choose your background.**`,
+        `**Step 3/6 — Choose your background.**`,
       components: [createBackgroundMenu(interaction.user.id)],
     });
   }
@@ -3426,7 +3711,7 @@ async function handleCharacterSelect(interaction) {
         `✅ Ancestry: **${draft.ancestry}**\n` +
         `✅ Class: **${draft.className}**\n` +
         `✅ Background: **${draft.background}**\n\n` +
-        `**Step 4/5 — Choose how your stats are assigned.**`,
+        `**Step 4/6 — Choose how your stats are assigned.**`,
       components: [createStatsMenu(interaction.user.id)],
     });
   }
@@ -3440,91 +3725,49 @@ async function handleCharacterSelect(interaction) {
         `✅ Class: **${draft.className}**\n` +
         `✅ Background: **${draft.background}**\n` +
         `✅ Stats: **${draft.statStyle}**\n\n` +
-        `**Step 5/5 — Choose your starting loadout.**`,
+        `**Step 5/6 — Choose your starting loadout.**`,
       components: [createLoadoutMenu(interaction.user.id, draft.className)],
     });
   }
 
   if (kind === "cc_loadout") {
     draft.loadout = value;
-    await interaction.update({
-      content: `✨ **Finishing ${draft.name}...**\nCreating your backstory and private character secret.`,
-      components: [],
+    creationSessions.set(key, draft);
+
+    return interaction.update({
+      content:
+        `🧙 **Creating ${draft.name}**\n\n` +
+        `✅ Ancestry: **${draft.ancestry}**\n` +
+        `✅ Class: **${draft.className}**\n` +
+        `✅ Background: **${draft.background}**\n` +
+        `✅ Stats: **${draft.statStyle}**\n` +
+        `✅ Loadout: **${draft.loadout}**\n\n` +
+        `**Step 6/6 — Create your backstory.**\n\n` +
+        `📖 **Already have one?** Type it yourself and it will be saved exactly as written.\n` +
+        `✨ **Need help?** Give the AI a general idea and it will turn it into a full character backstory.`,
+      components: [
+        createBackstoryModeMenu(interaction.user.id),
+      ],
     });
+  }
 
-    try {
-      const story = await aiCharacterStory(draft);
-      const classData = CLASS_DATA[draft.className];
-      const stats = statsForClass(draft.className, draft.statStyle);
-      const inventory = [...classData.loadouts[draft.loadout]];
+  if (kind === "cc_backstory") {
+    draft.backstoryMode = value;
+    creationSessions.set(key, draft);
 
-      const character = {
-        id: uid(),
-        guildId: interaction.guildId,
-        userId: interaction.user.id,
-        name: draft.name,
-        ancestry: draft.ancestry,
-        className: draft.className,
-        background: draft.background,
-        appearance: draft.appearance,
-        goal: draft.goal,
-        fear: draft.fear,
-        quirk: draft.quirk,
-        secret: story.secret,
-        backstory: story.backstory,
-        statStyle: draft.statStyle,
-        stats,
-        level: 1,
-        xp: 0,
-        levelUpHistory: [],
-        hp: classData.baseHp,
-        maxHp: classData.baseHp,
-        ac: classData.ac,
-        gold: 10,
-        inventory,
-        abilities: [...classData.abilities],
-        spells: [...(classData.spells || [])],
-        conditions: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-
-      setCharacter(interaction.guildId, interaction.user.id, character);
-      creationSessions.delete(key);
-
-      await interaction.followUp({
-        ephemeral: true,
-        embeds: [makeCharacterEmbed(character, interaction.user.username)],
-      });
-
-      const secretEmbed = new EmbedBuilder()
-        .setTitle(`🔒 ${character.name}'s Private Secret`)
-        .setDescription(character.secret)
-        .setFooter({ text: "The AI DM knows this. Other players do not." });
-
-      try {
-        await interaction.user.send({ embeds: [secretEmbed] });
-        await interaction.followUp({
-          ephemeral: true,
-          content:
-            "✅ **Character saved!** I also sent your private character secret by DM.",
-        });
-      } catch {
-        await interaction.followUp({
-          ephemeral: true,
-          content:
-            "✅ **Character saved!** I couldn't DM you, so your secret is shown privately below.",
-          embeds: [secretEmbed],
-        });
-      }
-    } catch (err) {
-      console.error("Character finalization error:", err);
-      await interaction.followUp({
-        ephemeral: true,
-        content:
-          "❌ I couldn't finish the character. Check the bot logs and your OpenAI configuration, then run `/createcharacter` again.",
-      });
+    if (value === "custom") {
+      return interaction.showModal(
+        createCustomBackstoryModal(
+          interaction.user.id
+        )
+      );
     }
+
+    return interaction.showModal(
+      createAIBackstoryIdeaModal(
+        interaction.user.id
+      )
+    );
   }
 }
 
@@ -4725,7 +4968,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               new EmbedBuilder()
                 .setTitle("🐉 AI Dungeon Master — Quick Start")
                 .setDescription(
-                  "**1.** `/createcharacter` — Build your adventurer.\n" +
+                  "**1.** `/createcharacter` — Build your adventurer, including your own backstory or an AI-written one from your idea.\n" +
                   "**2.** `/party create` — Make a party and share its code.\n" +
                   "**3.** Friends use `/party join`.\n" +
                   "**4.** Party leader uses `/adventure start`.\n" +
@@ -4781,6 +5024,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith("cc_details:")) {
       return handleCharacterDetails(interaction);
+    }
+
+    if (
+      interaction.isModalSubmit() &&
+      interaction.customId.startsWith("cc_backstory_")
+    ) {
+      return handleCharacterBackstoryModal(interaction);
     }
 
     if (
@@ -5137,6 +5387,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Multiplayer action window: ${PARTY_ACTION_WINDOW_MS / 1000}s`);
   console.log(`Downtime target: after ${DOWNTIME_AFTER_ACTION_BEATS} action beats when safe`);
   console.log("Turn-based Combat v1: ENABLED");
+  console.log("Character backstory choice: PLAYER-WRITTEN or AI-GENERATED");
 });
 
 process.on("SIGINT", () => {
