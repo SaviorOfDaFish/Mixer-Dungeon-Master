@@ -4288,19 +4288,45 @@ function normalize3DDie(value) {
   return SUPPORTED_3D_DICE[key] ? key : null;
 }
 
-function singleDieFromExpression(expression) {
+function parse3DDiceExpression(expression) {
   const match = String(expression || "")
     .trim()
     .toLowerCase()
-    .match(/^1?d(4|6|8|10|12|20|100)$/);
+    .replace(/\s+/g, "")
+    .match(/^(\d{0,2})d(4|6|8|10|12|20|100)([+-]\d{1,2})?$/);
 
   if (!match) return null;
 
-  const die = `d${match[1]}`;
+  const count = Math.max(1, Number(match[1] || 1));
+  const die = `d${match[2]}`;
+  const sides = SUPPORTED_3D_DICE[die];
+  const modifier = Number(match[3] || 0);
+  const physicalCount = count * (die === "d100" ? 2 : 1);
+
+  if (!sides) return null;
+  if (count < 1 || physicalCount > 10) return null;
+  if (modifier < -99 || modifier > 99) return null;
+
   return {
+    count,
     die,
-    sides: SUPPORTED_3D_DICE[die],
+    sides,
+    modifier,
+    physicalCount,
+    expression:
+      `${count}${die}` +
+      (modifier === 0
+        ? ""
+        : modifier > 0
+          ? `+${modifier}`
+          : `${modifier}`),
   };
+}
+
+function singleDieFromExpression(expression) {
+  const parsed = parse3DDiceExpression(expression);
+  if (!parsed || parsed.count !== 1 || parsed.modifier !== 0) return null;
+  return parsed;
 }
 
 async function handle3DRollCommand(interaction) {
@@ -4349,14 +4375,15 @@ async function handle3DRollCommand(interaction) {
     });
   }
 
-  const die = normalize3DDie(
-    interaction.options.getString("die", true)
+  const rollSpec = parse3DDiceExpression(
+    interaction.options.getString("dice", true)
   );
 
-  if (!die) {
+  if (!rollSpec) {
     return interaction.reply({
       ephemeral: true,
-      content: "That die is not supported by the 3D table.",
+      content:
+        "That 3D dice expression isn't supported. Try `d20`, `2d6`, `3d8+2`, or `4d10`. Maximum: **10 physical dice** (D100 uses two physical dice each).",
     });
   }
 
@@ -4364,11 +4391,11 @@ async function handle3DRollCommand(interaction) {
 
   const pending = {
     id: uid(),
-    checkName: `Manual ${die.toUpperCase()} Roll`,
+    checkName: `Manual ${rollSpec.expression.toUpperCase()} Roll`,
     ability: "NONE",
-    dice: `1${die}`,
+    dice: rollSpec.expression,
     dc: 0,
-    reason: `${character.name} is making a physical ${die.toUpperCase()} roll.`,
+    reason: `${character.name} is making a physical ${rollSpec.expression.toUpperCase()} roll.`,
     successDirection: "",
     failureDirection: "",
     channelId: interaction.channelId,
@@ -4925,21 +4952,13 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("3droll")
-    .setDescription("Roll a physical polyhedral die in the Discord 3D Dice Activity.")
+    .setDescription("Roll one or more physical dice in the Discord 3D Dice Activity.")
     .addStringOption((o) =>
       o
-        .setName("die")
-        .setDescription("Choose the physical die")
+        .setName("dice")
+        .setDescription("Dice expression, e.g. d20, 2d6, 3d8+2, 4d10")
         .setRequired(true)
-        .addChoices(
-          { name: "D4", value: "d4" },
-          { name: "D6", value: "d6" },
-          { name: "D8", value: "d8" },
-          { name: "D10", value: "d10" },
-          { name: "D12", value: "d12" },
-          { name: "D20", value: "d20" },
-          { name: "D100 Percentile", value: "d100" }
-        )
+        .setMaxLength(20)
     ),
 
   new SlashCommandBuilder()
@@ -5124,7 +5143,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   "**12.** `/askdm question:<your question>` privately asks the DM something without advancing the game.\n" +
                   "**13.** `/scene` generates the current cinematic scene and `/portrait` creates your character art.\n\n" +
                   "🎲 You can also roll manual dice with `/roll dice:2d6+3`.\n" +
-                  "🎲 Use `/3droll` for a physical D4, D6, D8, D10, D12, D20, or D100 in the Discord Activity.\n" +
+                  "🎲 Use `/3droll dice:2d6`, `/3droll dice:3d8+2`, etc. for physical multi-dice rolls in the Discord Activity.\n" +
                   `🖼️ Automatic cinematic images are limited to ${AUTO_IMAGE_LIMIT} per campaign.`
                 ),
             ],
@@ -5210,7 +5229,7 @@ function make3DDiceButton(pending) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`launch_3d_dice:${pending.id}`)
-      .setLabel(`Roll ${String(pending.dice || "1d20").replace(/^1/,"").toUpperCase()} in 3D`)
+      .setLabel(`Roll ${String(pending.dice || "1d20").toUpperCase()} in 3D`)
       .setEmoji("🎲")
       .setStyle(ButtonStyle.Primary)
   );
@@ -5258,6 +5277,10 @@ async function resolvePhysicalDie({
   userId,
   die,
   naturalRoll,
+  results = null,
+  submittedDice = "",
+  submittedModifier = 0,
+  submittedTotal = null,
 }) {
   const found = findBridgePending(
     guildId,
@@ -5271,37 +5294,60 @@ async function resolvePhysicalDie({
 
   const { character, party, campaign, pending } = found;
 
-  const pendingDie = singleDieFromExpression(
+  const pendingSpec = parse3DDiceExpression(
     pending.dice || "1d20"
   );
 
-  if (!pendingDie) {
-    return {
-      ok: false,
-      error: "UNSUPPORTED_DIE_EXPRESSION",
-    };
+  if (!pendingSpec) {
+    return { ok: false, error: "UNSUPPORTED_DIE_EXPRESSION" };
   }
 
   const submittedDie = normalize3DDie(die);
 
-  if (!submittedDie || submittedDie !== pendingDie.die) {
+  if (!submittedDie || submittedDie !== pendingSpec.die) {
     return {
       ok: false,
       error: "WRONG_DIE",
-      expected: pendingDie.die,
+      expected: pendingSpec.die,
     };
   }
 
-  if (
-    !Number.isInteger(naturalRoll) ||
-    naturalRoll < 1 ||
-    naturalRoll > pendingDie.sides
-  ) {
+  const submittedResults = Array.isArray(results)
+    ? results.map(Number)
+    : [Number(naturalRoll)];
+
+  if (submittedResults.length !== pendingSpec.count) {
     return {
       ok: false,
-      error: "INVALID_RESULT",
+      error: "WRONG_DICE_COUNT",
+      expected: pendingSpec.count,
     };
   }
+
+  const validResult = submittedResults.every(
+    (value) =>
+      Number.isInteger(value) &&
+      value >= 1 &&
+      value <= pendingSpec.sides
+  );
+
+  if (!validResult) {
+    return { ok: false, error: "INVALID_RESULT" };
+  }
+
+  const subtotal = submittedResults.reduce((sum, value) => sum + value, 0);
+  const expectedTotal = subtotal + pendingSpec.modifier;
+
+  if (
+    submittedTotal !== null &&
+    Number(submittedTotal) !== expectedTotal
+  ) {
+    return { ok: false, error: "TOTAL_MISMATCH" };
+  }
+
+  naturalRoll = pendingSpec.count === 1
+    ? submittedResults[0]
+    : expectedTotal;
 
   // Consume before posting so duplicate Activity submissions cannot resolve twice.
   delete campaign.pendingChecks[userId];
@@ -5325,19 +5371,39 @@ async function resolvePhysicalDie({
       checkName: pending.checkName,
       ability: "NONE",
       dice: pending.dice,
-      naturalRoll,
-      modifier: 0,
-      total: naturalRoll,
+      results: submittedResults,
+      subtotal,
+      modifier: pendingSpec.modifier,
+      naturalRoll:
+        pendingSpec.count === 1
+          ? submittedResults[0]
+          : null,
+      total: expectedTotal,
       outcome: "ROLLED",
     };
 
     appendLog(campaign, rollRecord);
     saveDataSoon();
 
+    const individualText =
+      submittedResults.length > 1
+        ? `Individual Dice: **${submittedResults.join(", ")}**\n`
+        : "";
+
+    const mathText =
+      pendingSpec.modifier === 0
+        ? submittedResults.length > 1
+          ? `${submittedResults.join(" + ")} = **${expectedTotal}**`
+          : `Physical Result: **${expectedTotal}**`
+        : `${submittedResults.join(" + ")} ${
+            pendingSpec.modifier > 0 ? "+" : "-"
+          } ${Math.abs(pendingSpec.modifier)} = **${expectedTotal}**`;
+
     await channel.send({
       content:
-        `🎲 **${character.name} rolled ${pendingDie.die.toUpperCase()} in 3D!**\n` +
-        `Physical Result: **${naturalRoll}**`,
+        `🎲 **${character.name} rolled ${pendingSpec.expression.toUpperCase()} in 3D!**\n` +
+        individualText +
+        `${mathText}`,
       allowedMentions: { parse: [] },
     });
 
@@ -5345,18 +5411,27 @@ async function resolvePhysicalDie({
 
     return {
       ok: true,
-      naturalRoll,
-      modifier: 0,
-      total: naturalRoll,
+      results: submittedResults,
+      subtotal,
+      modifier: pendingSpec.modifier,
+      naturalRoll:
+        pendingSpec.count === 1
+          ? submittedResults[0]
+          : null,
+      total: expectedTotal,
       outcome: "ROLLED",
       characterName: character.name,
       checkName: pending.checkName,
-      die: pendingDie.die,
+      die: pendingSpec.die,
+      dice: pendingSpec.expression,
     };
   }
 
-  // Normal DM-requested checks can now use any supported single die,
-  // although the current core skill/combat system normally asks for d20.
+  // Core DM checks currently expect one physical die.
+  if (pendingSpec.count !== 1) {
+    return { ok: false, error: "MULTIDICE_CHECK_UNSUPPORTED" };
+  }
+
   const modifier =
     pending.ability && pending.ability !== "NONE"
       ? character.stats[pending.ability] || 0
@@ -5384,7 +5459,7 @@ async function resolvePhysicalDie({
 
   appendLog(campaign, rollRecord);
 
-  const isD20 = pendingDie.die === "d20";
+  const isD20 = pendingSpec.die === "d20";
 
   const xpAmount =
     pending.noCheckXP
@@ -5418,7 +5493,7 @@ async function resolvePhysicalDie({
   await channel.send({
     content:
       `🎲 **${character.name} — ${pending.checkName.replace(/([a-z])([A-Z])/g, "$1 $2")}**\n` +
-      `Physical ${pendingDie.die.toUpperCase()} Roll: **${naturalRoll}**\n` +
+      `Physical ${pendingSpec.die.toUpperCase()} Roll: **${naturalRoll}**\n` +
       (pending.ability && pending.ability !== "NONE"
         ? `${pending.ability}: **${formatModifier(modifier)}**\n`
         : "") +
@@ -5509,7 +5584,7 @@ async function resolvePhysicalDie({
     outcome,
     characterName: character.name,
     checkName: pending.checkName,
-    die: pendingDie.die,
+    die: pendingSpec.die,
   };
 }
 
@@ -5557,7 +5632,10 @@ bridgeApp.post("/dice/pending", (req, res) => {
       checkName: pending.checkName,
       dice: pending.dice || "1d20",
       ability: pending.ability,
-      modifier: character.stats[pending.ability] || 0,
+      modifier:
+        pending.ability && pending.ability !== "NONE"
+          ? character.stats[pending.ability] || 0
+          : 0,
       reason: pending.reason || "",
     },
   });
@@ -5568,7 +5646,17 @@ bridgeApp.post("/dice/result", async (req, res) => {
     return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
   }
 
-  const { guildId, channelId, userId, die, result } = req.body || {};
+  const {
+    guildId,
+    channelId,
+    userId,
+    die,
+    dice,
+    result,
+    results,
+    modifier,
+    total,
+  } = req.body || {};
 
   if (!guildId || !channelId || !userId) {
     return res.status(400).json({ ok: false, error: "MISSING_FIELDS" });
@@ -5590,6 +5678,13 @@ bridgeApp.post("/dice/result", async (req, res) => {
       userId: String(userId),
       die: submittedDie,
       naturalRoll: Number(result),
+      results,
+      submittedDice: String(dice || ""),
+      submittedModifier: Number(modifier || 0),
+      submittedTotal:
+        total === undefined || total === null
+          ? null
+          : Number(total),
     });
 
     if (!resolved.ok) {
