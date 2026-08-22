@@ -1987,6 +1987,104 @@ async function resolveCombatAttackAfterRoll({
   );
 }
 
+async function resolveCombatAttackAfterPhysicalRoll({
+  channel,
+  campaign,
+  party,
+  character,
+  pending,
+  naturalRoll,
+  outcome,
+}) {
+  const combat = campaign.combat;
+
+  if (!combat?.active) {
+    await channel.send(
+      "⚠️ The attack roll resolved, but the combat encounter is no longer active."
+    );
+    return;
+  }
+
+  const enemy = combat.enemies.find(
+    (item) => item.id === pending.combatTargetId
+  );
+
+  if (!enemy || enemy.defeated || enemy.hp <= 0) {
+    await channel.send(
+      "⚠️ That target was already defeated. Your turn will advance."
+    );
+    await advanceCombatTurn(campaign, party, channel);
+    return;
+  }
+
+  if (outcome === "SUCCESS") {
+    const damageExpression =
+      naturalRoll === 20
+        ? doubleDamageDice(pending.combatDamageDice || "1d6")
+        : pending.combatDamageDice || "1d6";
+
+    const damageRoll = rollDice(damageExpression);
+    const damage = Math.max(1, damageRoll?.total || 1);
+
+    enemy.hp = Math.max(0, enemy.hp - damage);
+
+    if (enemy.hp <= 0) {
+      enemy.defeated = true;
+    }
+
+    appendLog(campaign, {
+      type: "combat_damage",
+      source: "3d_activity",
+      userId: character.userId,
+      characterName: character.name,
+      targetId: enemy.id,
+      targetName: enemy.name,
+      naturalRoll,
+      damage,
+      damageExpression,
+      defeated: enemy.defeated,
+    });
+
+    saveDataSoon();
+
+    await channel.send({
+      content:
+        `💥 **${character.name} hits ${enemy.name}!**\n` +
+        `${naturalRoll === 20 ? "🌟 **CRITICAL HIT!**\n" : ""}` +
+        `🎲 Damage: **${damage}** (${damageExpression})\n` +
+        `❤️ ${enemy.name}: **${enemy.hp}/${enemy.maxHp} HP**` +
+        (enemy.defeated
+          ? `\n☠️ **${enemy.name} is defeated!**`
+          : ""),
+      allowedMentions: { parse: [] },
+    });
+  } else {
+    appendLog(campaign, {
+      type: "combat_miss",
+      source: "3d_activity",
+      userId: character.userId,
+      characterName: character.name,
+      targetId: enemy.id,
+      targetName: enemy.name,
+      naturalRoll,
+    });
+
+    saveDataSoon();
+
+    await channel.send({
+      content: `💨 **${character.name}'s attack misses ${enemy.name}.**`,
+      allowedMentions: { parse: [] },
+    });
+  }
+
+  if (!livingEnemies(campaign).length) {
+    await endCombatVictory(campaign, party, channel);
+    return;
+  }
+
+  await advanceCombatTurn(campaign, party, channel);
+}
+
 async function endCombatVictory(campaign, party, channel) {
   const combat = campaign.combat;
   if (!combat?.active) return;
@@ -5463,6 +5561,36 @@ async function resolvePhysicalD20({
     });
   }
 
+  // Physical combat rolls must resolve through the combat engine.
+  // v1.7.4 incorrectly treated them like normal story checks, which meant
+  // the d20 message appeared but damage/HP/initiative never happened.
+  if (pending.combatAttack) {
+    await resolveCombatAttackAfterPhysicalRoll({
+      channel,
+      campaign,
+      party,
+      character,
+      pending,
+      naturalRoll,
+      outcome,
+    });
+
+    return {
+      ok: true,
+      naturalRoll,
+      rolls: modeResult.rolls,
+      rollMode: modeResult.mode,
+      modifier,
+      total,
+      outcome,
+      characterName: character.name,
+      checkName: pending.checkName,
+      combatResolved: true,
+      campaignChannelId: campaign.channelId,
+      pendingId: pending.id,
+    };
+  }
+
   try {
     const resolved = await aiResolveCheck(campaign, party, rollRecord, pending);
     appendLog(campaign, { type: "dm", text: resolved.narration });
@@ -5501,6 +5629,7 @@ async function resolvePhysicalD20({
     pendingId: pending.id,
   };
 }
+
 
 // Railway HTTP API used ONLY by the Dice Activity backend.
 // The shared secret never appears in browser/client JavaScript.
@@ -5671,6 +5800,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log("Backstory modal hotfix v1.7.2: ENABLED");
   console.log("3D dice multiplayer/voice-channel bridge fix v1.7.3: ENABLED");
   console.log("Advantage / Disadvantage v1.7.4: ENABLED");
+  console.log("3D combat resolution hotfix v1.7.5: ENABLED");
 });
 
 process.on("SIGINT", () => {
