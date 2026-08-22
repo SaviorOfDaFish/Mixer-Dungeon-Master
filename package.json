@@ -1,6 +1,6 @@
 {
   "name": "mixed-dnd-ai-dm",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Discord AI Dungeon Master with full physical 3D dice set, backstories, downtime, combat and multiplayer",
   "type": "module",
   "main": "index.js",
