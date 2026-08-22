@@ -43,6 +43,8 @@ const PORTRAIT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const DICE_BRIDGE_SECRET = process.env.DICE_BRIDGE_SECRET || "";
 const HTTP_PORT = Number(process.env.PORT || 3000);
 const PARTY_ACTION_WINDOW_MS = 20 * 1000;
+const DOWNTIME_AFTER_ACTION_BEATS = 3;
+const MAX_COMBAT_ENEMIES = 6;
 
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN.");
 if (!DISCORD_CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID.");
@@ -664,6 +666,10 @@ async function aiDMPartyAction(campaign, party, actions) {
       roll_reason: "",
       consequences_success: "",
       consequences_failure: "",
+      scene_mode: "action",
+      combat_enemy_name: "",
+      combat_enemy_archetype: "none",
+      combat_enemy_count: 0,
       image_type: "none",
       image_prompt: "",
     };
@@ -684,13 +690,17 @@ async function aiDMPartyAction(campaign, party, actions) {
         summary: campaign.summary,
         location: campaign.location,
       },
+      pacing: campaignPacingContext(campaign),
       party: partyMembersContext(party),
       recentHistory: recentCampaignContext(campaign),
       partyActions: participants,
       instruction:
         "Resolve these party declarations together as one tabletop scene. Respect each player's declared action. Do not invent actions for players. " +
-        "If one meaningful uncertain action needs a roll, request exactly one check for the most appropriate PARTICIPATING player by returning that player's Discord playerId. " +
-        "If multiple players are helping the same task, reflect that help narratively but still request no more than one check in this response. " +
+        "If pacing.downtimeActive is true, prioritize conversation, rest, personal interaction, planning, food, watch shifts, and character moments; do not inject a new emergency unless the players clearly leave safety or seek danger. " +
+        "If pacing.downtimeStronglyDue is true and there is no immediate unresolved danger, you MUST create a meaningful downtime/social beat instead of another action escalation. " +
+        "If genuine hostilities begin, use action_type combat_start and provide enemy name/archetype/count; do not resolve combat yourself. " +
+        "If one meaningful uncertain non-combat action needs a roll, request exactly one check for the most appropriate PARTICIPATING player. " +
+        "If multiple players are helping the same task, reflect that help narratively but still request no more than one check. " +
         "Otherwise narrate the combined result without a check.",
     },
     null,
@@ -784,6 +794,25 @@ async function processPartyActionWindow(campaignId) {
       party,
       result
     );
+
+    if (result.action_type === "combat_start") {
+      recordScenePacing(campaign, "combat");
+      await startCombatFromDM(campaign, party, channel, result);
+      return;
+    }
+
+    recordScenePacing(
+      campaign,
+      result.scene_mode || "action"
+    );
+
+    if (result.scene_mode === "downtime") {
+      await sendDowntimeBanner(
+        channel,
+        campaign,
+        "The scene has reached a natural lull."
+      );
+    }
 
     const participatingIds = new Set(actions.map((action) => action.userId));
 
@@ -891,6 +920,1157 @@ function resumePartyWindowAfterRoll(campaign) {
   if (!party) return;
 
   schedulePartyWindow(campaign, party, windowState.channel);
+}
+
+// ============================================================
+// DOWNTIME / PACING
+// ============================================================
+
+function normalizeCampaignPacing(campaign) {
+  campaign.pacing ||= {
+    actionBeats: 0,
+    downtimeActive: false,
+    lastDowntimeAt: 0,
+    lastCombatAt: 0,
+  };
+
+  campaign.pacing.actionBeats = Math.max(
+    0,
+    Number(campaign.pacing.actionBeats || 0)
+  );
+  campaign.pacing.downtimeActive = Boolean(campaign.pacing.downtimeActive);
+  campaign.pacing.lastDowntimeAt = Number(campaign.pacing.lastDowntimeAt || 0);
+  campaign.pacing.lastCombatAt = Number(campaign.pacing.lastCombatAt || 0);
+
+  return campaign.pacing;
+}
+
+function campaignPacingContext(campaign) {
+  const pacing = normalizeCampaignPacing(campaign);
+
+  return {
+    actionBeatsSinceDowntime: pacing.actionBeats,
+    downtimeActive: pacing.downtimeActive,
+    downtimeStronglyDue:
+      pacing.actionBeats >= DOWNTIME_AFTER_ACTION_BEATS,
+  };
+}
+
+function recordScenePacing(campaign, sceneMode = "action") {
+  const pacing = normalizeCampaignPacing(campaign);
+
+  if (sceneMode === "downtime") {
+    pacing.actionBeats = 0;
+    pacing.downtimeActive = true;
+    pacing.lastDowntimeAt = Date.now();
+  } else if (sceneMode === "combat") {
+    pacing.downtimeActive = false;
+    pacing.lastCombatAt = Date.now();
+    pacing.actionBeats += 1;
+  } else {
+    if (pacing.downtimeActive && sceneMode === "action") {
+      // The players have chosen to move the story out of downtime.
+      pacing.downtimeActive = false;
+    }
+    pacing.actionBeats += 1;
+  }
+
+  campaign.updatedAt = Date.now();
+  saveDataSoon();
+}
+
+async function sendDowntimeBanner(channel, campaign, reason = "") {
+  normalizeCampaignPacing(campaign);
+
+  await channel.send({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("🌙 Downtime")
+        .setDescription(
+          (reason
+            ? `${reason}\n\n`
+            : "") +
+          "The immediate pressure has eased. **Nothing is forcing the party forward right now.** " +
+          "This is a good time to talk in character, eat, tend wounds, investigate belongings, " +
+          "visit NPCs, make plans, keep watch, or sleep.\n\n" +
+          "The DM will let this scene breathe until the party chooses to move on."
+        )
+        .setFooter({
+          text:
+            "Use normal messages for roleplay • /rest short or /rest long when appropriate • /ready still works",
+        }),
+    ],
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handleRestCommand(interaction) {
+  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+
+  if (!party) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "You need to be in a party before resting.",
+    });
+  }
+
+  const campaign = getActiveCampaignForChannel(
+    interaction.guildId,
+    interaction.channelId
+  );
+
+  if (!campaign || campaign.partyId !== party.id) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "Use `/rest` in your active adventure channel.",
+    });
+  }
+
+  if (campaign.combat?.active) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "⚔️ You can't take a rest while combat is active.",
+    });
+  }
+
+  if (pendingRollCount(campaign) > 0) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "🎲 Resolve the party's pending roll before resting.",
+    });
+  }
+
+  const type = interaction.options.getString("type", true);
+  normalizeCampaignPacing(campaign);
+
+  const results = [];
+
+  for (const memberId of party.memberIds) {
+    const character = getCharacter(interaction.guildId, memberId);
+    if (!character) continue;
+
+    const before = character.hp;
+
+    if (type === "long") {
+      character.hp = character.maxHp;
+    } else {
+      const classData = CLASS_DATA[character.className];
+      const hitDie = Number(classData?.hitDie || 8);
+      const heal = Math.max(
+        1,
+        Math.floor(hitDie / 2) + 1 + Number(character.stats?.CON || 0)
+      );
+      character.hp = Math.min(character.maxHp, character.hp + heal);
+    }
+
+    results.push(
+      `**${character.name}:** ${before} → **${character.hp}/${character.maxHp} HP**`
+    );
+  }
+
+  campaign.pacing.actionBeats = 0;
+  campaign.pacing.downtimeActive = true;
+  campaign.pacing.lastDowntimeAt = Date.now();
+
+  appendLog(campaign, {
+    type: "system",
+    text:
+      type === "long"
+        ? "The party completed a long rest."
+        : "The party completed a short rest.",
+  });
+
+  saveDataSoon();
+
+  await interaction.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle(type === "long" ? "🌙 Long Rest" : "🔥 Short Rest")
+        .setDescription(
+          (type === "long"
+            ? "The party settles in and gets meaningful sleep and recovery."
+            : "The party pauses to catch its breath, eat, bandage wounds, and regroup.") +
+          `\n\n${results.join("\n")}`
+        )
+        .setFooter({
+          text:
+            type === "long"
+              ? "HP restored to maximum."
+              : "Each character recovered a class-based amount of HP.",
+        }),
+    ],
+  });
+
+  await sendDowntimeBanner(
+    interaction.channel,
+    campaign,
+    type === "long"
+      ? "Morning—or whatever passes for it here—comes without an immediate crisis."
+      : "For a little while, the party has room to simply be together."
+  );
+}
+
+// ============================================================
+// TURN-BASED COMBAT ENGINE v1
+// ============================================================
+
+const ENEMY_ARCHETYPES = {
+  minion: {
+    label: "Minion",
+    acBase: 11,
+    hpBase: 4,
+    hpPerLevel: 2,
+    attackBase: 2,
+    damage: "1d4",
+    xp: 20,
+  },
+  skirmisher: {
+    label: "Skirmisher",
+    acBase: 13,
+    hpBase: 8,
+    hpPerLevel: 3,
+    attackBase: 3,
+    damage: "1d6",
+    xp: 35,
+  },
+  brute: {
+    label: "Brute",
+    acBase: 12,
+    hpBase: 14,
+    hpPerLevel: 5,
+    attackBase: 3,
+    damage: "1d8",
+    xp: 50,
+  },
+  caster: {
+    label: "Caster",
+    acBase: 12,
+    hpBase: 7,
+    hpPerLevel: 3,
+    attackBase: 3,
+    damage: "1d8",
+    xp: 45,
+  },
+  boss: {
+    label: "Boss",
+    acBase: 15,
+    hpBase: 28,
+    hpPerLevel: 9,
+    attackBase: 4,
+    damage: "1d10",
+    xp: 120,
+  },
+};
+
+function averagePartyLevel(party, guildId) {
+  const levels = party.memberIds
+    .map((id) => getCharacter(guildId, id)?.level || 1)
+    .filter(Boolean);
+
+  if (!levels.length) return 1;
+  return Math.max(
+    1,
+    Math.round(levels.reduce((sum, level) => sum + level, 0) / levels.length)
+  );
+}
+
+function makeEnemy({
+  name,
+  archetype = "skirmisher",
+  level = 1,
+  number = 1,
+}) {
+  const template =
+    ENEMY_ARCHETYPES[archetype] || ENEMY_ARCHETYPES.skirmisher;
+
+  const proficiency = proficiencyBonusForLevel(level);
+  const hp =
+    template.hpBase +
+    template.hpPerLevel * level +
+    (archetype === "boss" ? level * 3 : 0);
+
+  return {
+    id: `enemy_${uid()}`,
+    name: number > 1 ? `${name} ${number}` : name,
+    baseName: name,
+    archetype,
+    ac:
+      template.acBase +
+      Math.floor((level - 1) / 5),
+    hp,
+    maxHp: hp,
+    attackBonus: template.attackBase + proficiency,
+    damageDice: template.damage,
+    xpValue: template.xp + level * 5,
+    defeated: false,
+  };
+}
+
+function combatantLabel(campaign, combatant) {
+  if (!combatant) return "Unknown";
+
+  if (combatant.type === "player") {
+    return getCharacter(campaign.guildId, combatant.userId)?.name || "Adventurer";
+  }
+
+  const enemy = campaign.combat?.enemies?.find(
+    (item) => item.id === combatant.enemyId
+  );
+  return enemy?.name || "Enemy";
+}
+
+function currentCombatant(campaign) {
+  if (!campaign.combat?.active) return null;
+  return campaign.combat.initiative[campaign.combat.turnIndex] || null;
+}
+
+function livingEnemies(campaign) {
+  return (campaign.combat?.enemies || []).filter(
+    (enemy) => !enemy.defeated && enemy.hp > 0
+  );
+}
+
+function consciousPartyMembers(campaign, party) {
+  return party.memberIds
+    .map((id) => ({ id, character: getCharacter(campaign.guildId, id) }))
+    .filter(({ character }) => character && character.hp > 0);
+}
+
+function combatDamageDice(character, checkName = "Attack") {
+  if (checkName === "SpellAttack") {
+    if (character.className === "Wizard" || character.className === "Warlock") {
+      return "1d10";
+    }
+    return "1d8";
+  }
+
+  if (checkName === "RangedAttack") return "1d8";
+
+  switch (character.className) {
+    case "Barbarian":
+      return "1d12";
+    case "Fighter":
+      return "1d8";
+    case "Rogue":
+      return "1d8";
+    case "Ranger":
+      return "1d8";
+    case "Cleric":
+      return "1d8";
+    case "Paladin":
+      return "1d8";
+    case "Bard":
+      return "1d8";
+    default:
+      return "1d6";
+  }
+}
+
+function doubleDamageDice(expression) {
+  const match = String(expression).match(/^(\d*)d(\d+)([+-]\d+)?$/i);
+  if (!match) return expression;
+
+  const count = Number(match[1] || 1);
+  const sides = Number(match[2]);
+  const modifier = match[3] || "";
+
+  return `${Math.max(1, count * 2)}d${sides}${modifier}`;
+}
+
+function combatStatusEmbed(campaign, party) {
+  const combat = campaign.combat;
+  const current = currentCombatant(campaign);
+
+  const partyLines = party.memberIds.map((userId) => {
+    const character = getCharacter(campaign.guildId, userId);
+    if (!character) return `❔ Unknown adventurer`;
+
+    return `${character.hp > 0 ? "❤️" : "💀"} **${character.name}** — ${Math.max(0, character.hp)}/${character.maxHp} HP • AC ${character.ac}`;
+  });
+
+  const enemyLines = (combat.enemies || []).map((enemy) => {
+    return `${enemy.defeated || enemy.hp <= 0 ? "☠️" : "👹"} **${enemy.name}** — ${Math.max(0, enemy.hp)}/${enemy.maxHp} HP`;
+  });
+
+  return new EmbedBuilder()
+    .setTitle(`⚔️ Combat — Round ${combat.round}`)
+    .setDescription(
+      `**Current Turn:** ${combatantLabel(campaign, current)}\n\n` +
+      `### Party\n${partyLines.join("\n")}\n\n` +
+      `### Enemies\n${enemyLines.join("\n")}`
+    )
+    .setFooter({
+      text:
+        current?.type === "player"
+          ? "Current player: describe your combat action normally in chat."
+          : "Enemy turn is resolving automatically.",
+    });
+}
+
+async function handleCombatStatus(interaction) {
+  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const campaign = party
+    ? getActiveCampaignForChannel(interaction.guildId, interaction.channelId)
+    : null;
+
+  if (!party || !campaign || campaign.partyId !== party.id) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "There is no active party adventure in this channel.",
+    });
+  }
+
+  if (!campaign.combat?.active) {
+    return interaction.reply({
+      ephemeral: true,
+      content: "There is no active combat encounter.",
+    });
+  }
+
+  return interaction.reply({
+    ephemeral: true,
+    embeds: [combatStatusEmbed(campaign, party)],
+  });
+}
+
+async function startCombatFromDM(campaign, party, channel, result) {
+  const level = averagePartyLevel(party, campaign.guildId);
+  const requestedCount = clamp(Number(result.combat_enemy_count || 1), 1, MAX_COMBAT_ENEMIES);
+  const name = String(result.combat_enemy_name || "Hostile Creature").slice(0, 60);
+  const archetype = ENEMY_ARCHETYPES[result.combat_enemy_archetype]
+    ? result.combat_enemy_archetype
+    : "skirmisher";
+
+  const enemies = Array.from({ length: requestedCount }, (_, index) =>
+    makeEnemy({
+      name,
+      archetype,
+      level,
+      number: requestedCount > 1 ? index + 1 : 1,
+    })
+  );
+
+  const initiative = [];
+
+  for (const userId of party.memberIds) {
+    const character = getCharacter(campaign.guildId, userId);
+    if (!character || character.hp <= 0) continue;
+
+    const roll = 1 + Math.floor(Math.random() * 20);
+    initiative.push({
+      type: "player",
+      userId,
+      roll,
+      modifier: character.stats?.DEX || 0,
+      total: roll + (character.stats?.DEX || 0),
+    });
+  }
+
+  for (const enemy of enemies) {
+    const roll = 1 + Math.floor(Math.random() * 20);
+    const modifier = Math.max(0, Math.floor(level / 3));
+    initiative.push({
+      type: "enemy",
+      enemyId: enemy.id,
+      roll,
+      modifier,
+      total: roll + modifier,
+    });
+  }
+
+  initiative.sort((a, b) => b.total - a.total);
+
+  campaign.combat = {
+    active: true,
+    round: 1,
+    turnIndex: 0,
+    enemies,
+    initiative,
+    startedAt: Date.now(),
+    threatName: name,
+  };
+
+  normalizeCampaignPacing(campaign);
+  campaign.pacing.downtimeActive = false;
+  campaign.pacing.lastCombatAt = Date.now();
+
+  clearPartyWindowTimer(getPartyWindow(campaign.id));
+  saveDataSoon();
+
+  const order = initiative
+    .map(
+      (item, index) =>
+        `${index + 1}. **${combatantLabel(campaign, item)}** — ${item.total}`
+    )
+    .join("\n");
+
+  await channel.send({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("⚔️ COMBAT BEGINS!")
+        .setDescription(
+          `${result.narration}\n\n### Initiative\n${order}`
+        )
+        .setFooter({
+          text:
+            "Player turns use normal chat. When a roll is requested, /roll is the reliable option.",
+        }),
+    ],
+  });
+
+  await continueCombatTurns(campaign, party, channel);
+}
+
+function pickEnemyTarget(campaign, requestedId = "") {
+  const living = livingEnemies(campaign);
+  if (!living.length) return null;
+
+  return (
+    living.find((enemy) => enemy.id === requestedId) ||
+    living[0]
+  );
+}
+
+async function aiDMCombatTurn(campaign, party, character, playerText) {
+  if (!openai) {
+    return {
+      narration: `${character.name} prepares to strike.`,
+      action_kind: "attack",
+      check_name: "Attack",
+      ability: "STR",
+      target_id: livingEnemies(campaign)[0]?.id || "",
+      roll_reason: "Make an attack roll.",
+    };
+  }
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      narration: { type: "string" },
+      action_kind: {
+        type: "string",
+        enum: ["attack", "ranged", "spell", "defend", "utility"],
+      },
+      check_name: {
+        type: "string",
+        enum: [
+          "Attack",
+          "RangedAttack",
+          "SpellAttack",
+          "Athletics",
+          "Acrobatics",
+          "Arcana",
+          "Medicine",
+          "None",
+        ],
+      },
+      ability: {
+        type: "string",
+        enum: ["STR", "DEX", "CON", "INT", "WIS", "CHA", "NONE"],
+      },
+      target_id: { type: "string" },
+      roll_reason: { type: "string" },
+    },
+    required: [
+      "narration",
+      "action_kind",
+      "check_name",
+      "ability",
+      "target_id",
+      "roll_reason",
+    ],
+  };
+
+  const response = await openai.responses.create({
+    model: OPENAI_MODEL,
+    instructions:
+      DM_INSTRUCTIONS +
+      `
+COMBAT TURN RULES:
+- This is one player's turn in initiative.
+- Interpret only the action they declared.
+- Do not resolve an attack hit/miss yourself.
+- For a weapon attack use Attack or RangedAttack.
+- For an offensive spell requiring an attack use SpellAttack.
+- Defend or simple movement may use check_name None.
+- target_id MUST be one of the living enemy IDs supplied, unless the action has no target.
+- Keep combat narration short and punchy.
+`,
+    input: JSON.stringify(
+      {
+        actingCharacter: {
+          name: character.name,
+          className: character.className,
+          hp: character.hp,
+          maxHp: character.maxHp,
+          ac: character.ac,
+          stats: character.stats,
+          abilities: character.abilities,
+          spells: character.spells || [],
+          inventory: character.inventory,
+        },
+        livingEnemies: livingEnemies(campaign).map((enemy) => ({
+          id: enemy.id,
+          name: enemy.name,
+          archetype: enemy.archetype,
+          hp: enemy.hp,
+          maxHp: enemy.maxHp,
+        })),
+        playerAction: playerText,
+      },
+      null,
+      2
+    ),
+    text: {
+      format: {
+        type: "json_schema",
+        name: "combat_turn",
+        strict: true,
+        schema,
+      },
+    },
+  });
+
+  return JSON.parse(response.output_text);
+}
+
+async function processCombatPlayerMessage(message, campaign, party) {
+  const combat = campaign.combat;
+  if (!combat?.active) return;
+
+  if (pendingRollCount(campaign) > 0) {
+    const character = getCharacter(message.guildId, message.author.id);
+
+    if (campaign.pendingChecks?.[message.author.id]) {
+      await message.reply(
+        `🎲 **${character?.name || "You"} still need to resolve your combat roll.** Type **\`/roll\`**.`
+      );
+    }
+    return;
+  }
+
+  const turn = currentCombatant(campaign);
+
+  if (!turn || turn.type !== "player") {
+    return;
+  }
+
+  if (turn.userId !== message.author.id) {
+    const actingName = combatantLabel(campaign, turn);
+    await message.reply(
+      `⏳ It's currently **${actingName}'s turn**. You can keep discussing tactics in voice chat, but combat actions resolve in initiative order.`
+    );
+    return;
+  }
+
+  const character = getCharacter(message.guildId, message.author.id);
+  if (!character || character.hp <= 0) {
+    await advanceCombatTurn(campaign, party, message.channel);
+    return;
+  }
+
+  const text = cleanPlayerText(message.content);
+  if (!text) return;
+
+  await message.channel.sendTyping();
+
+  try {
+    const result = await aiDMCombatTurn(
+      campaign,
+      party,
+      character,
+      text
+    );
+
+    appendLog(campaign, {
+      type: "combat_action",
+      userId: message.author.id,
+      characterName: character.name,
+      text,
+    });
+
+    await message.channel.send(
+      `⚔️ **${character.name}'s Turn**\n${result.narration}`
+    );
+
+    if (
+      ["attack", "ranged", "spell"].includes(result.action_kind) &&
+      result.check_name !== "None"
+    ) {
+      const target = pickEnemyTarget(campaign, result.target_id);
+
+      if (!target) {
+        await endCombatVictory(campaign, party, message.channel);
+        return;
+      }
+
+      const ability =
+        result.ability === "NONE"
+          ? result.check_name === "SpellAttack"
+            ? ["Wizard"].includes(character.className)
+              ? "INT"
+              : ["Cleric", "Ranger"].includes(character.className)
+                ? "WIS"
+                : "CHA"
+            : result.check_name === "RangedAttack"
+              ? "DEX"
+              : "STR"
+          : result.ability;
+
+      campaign.pendingChecks ||= {};
+      campaign.pendingChecks[message.author.id] = {
+        id: uid(),
+        checkName: result.check_name,
+        ability,
+        dice: "1d20",
+        dc: target.ac,
+        reason:
+          result.roll_reason ||
+          `Attack ${target.name}.`,
+        successDirection: `Hit ${target.name}.`,
+        failureDirection: `Miss ${target.name}.`,
+        channelId: campaign.channelId,
+        createdAt: Date.now(),
+        combatAttack: true,
+        combatTargetId: target.id,
+        combatDamageDice: combatDamageDice(
+          character,
+          result.check_name
+        ),
+        noCheckXP: true,
+      };
+
+      saveDataSoon();
+
+      const pending = campaign.pendingChecks[message.author.id];
+
+      await message.channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle(
+              `🎲 ${character.name} attacks ${target.name}!`
+            )
+            .setDescription(
+              `${pending.reason}\n\n**Target AC:** hidden from the player roll flow`
+            )
+            .addFields(
+              {
+                name: "Roll",
+                value: "**1d20**",
+                inline: true,
+              },
+              {
+                name: "Modifier",
+                value: `${ability} ${formatModifier(character.stats[ability] || 0)}`,
+                inline: true,
+              }
+            )
+            .setFooter({
+              text:
+                "Type /roll to resolve the attack. 3D Dice remains optional/experimental.",
+            }),
+        ],
+        components: [make3DDiceButton(pending)],
+      });
+
+      return;
+    }
+
+    // Defend / utility actions do not require a roll in Combat v1.
+    if (result.action_kind === "defend") {
+      combat.defending ||= {};
+      combat.defending[message.author.id] = true;
+
+      await message.channel.send(
+        `🛡️ **${character.name} takes a defensive stance.** Their AC is temporarily +2 until their next turn.`
+      );
+    }
+
+    await advanceCombatTurn(campaign, party, message.channel);
+  } catch (err) {
+    console.error("Combat player-turn error:", err);
+    await message.channel.send(
+      "⚠️ The DM couldn't interpret that combat action. Try describing the action again."
+    );
+  }
+}
+
+function effectiveCharacterAC(campaign, userId, character) {
+  const defending = Boolean(campaign.combat?.defending?.[userId]);
+  return character.ac + (defending ? 2 : 0);
+}
+
+async function runEnemyTurn(campaign, party, channel, enemy) {
+  const conscious = consciousPartyMembers(campaign, party);
+
+  if (!conscious.length) {
+    await endCombatDefeat(campaign, party, channel);
+    return;
+  }
+
+  // Attack the conscious party member with the lowest current HP.
+  conscious.sort((a, b) => a.character.hp - b.character.hp);
+  const target = conscious[0];
+  const targetAC = effectiveCharacterAC(
+    campaign,
+    target.id,
+    target.character
+  );
+
+  const natural = 1 + Math.floor(Math.random() * 20);
+  const total = natural + enemy.attackBonus;
+  const hit = natural === 20 || (natural !== 1 && total >= targetAC);
+
+  let damage = 0;
+
+  if (hit) {
+    const damageRoll = rollDice(
+      natural === 20
+        ? doubleDamageDice(enemy.damageDice)
+        : enemy.damageDice
+    );
+
+    damage = Math.max(1, damageRoll?.total || 1);
+    target.character.hp = Math.max(
+      0,
+      target.character.hp - damage
+    );
+    target.character.updatedAt = Date.now();
+  }
+
+  saveDataSoon();
+
+  await channel.send({
+    content:
+      `👹 **${enemy.name}'s Turn**\n` +
+      `Attack Roll: **${natural}** + ${enemy.attackBonus} = **${total}** vs ${target.character.name}'s AC **${targetAC}**\n` +
+      (hit
+        ? `💥 **HIT! ${damage} damage.** ${target.character.name}: **${target.character.hp}/${target.character.maxHp} HP**`
+        : `💨 **MISS!**`) +
+      (target.character.hp <= 0
+        ? `\n💀 **${target.character.name} is down!**`
+        : ""),
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function advanceCombatTurn(campaign, party, channel) {
+  const combat = campaign.combat;
+  if (!combat?.active) return;
+
+  if (!livingEnemies(campaign).length) {
+    await endCombatVictory(campaign, party, channel);
+    return;
+  }
+
+  if (!consciousPartyMembers(campaign, party).length) {
+    await endCombatDefeat(campaign, party, channel);
+    return;
+  }
+
+  // Clear defend when that player's next turn arrives, handled below.
+  let safety = 0;
+
+  while (combat.active && safety++ < 30) {
+    combat.turnIndex += 1;
+
+    if (combat.turnIndex >= combat.initiative.length) {
+      combat.turnIndex = 0;
+      combat.round += 1;
+
+      await channel.send(`## ⚔️ Round ${combat.round}`);
+    }
+
+    const turn = currentCombatant(campaign);
+    if (!turn) return;
+
+    if (turn.type === "enemy") {
+      const enemy = combat.enemies.find(
+        (item) => item.id === turn.enemyId
+      );
+
+      if (!enemy || enemy.defeated || enemy.hp <= 0) continue;
+
+      await runEnemyTurn(
+        campaign,
+        party,
+        channel,
+        enemy
+      );
+
+      if (!combat.active) return;
+      continue;
+    }
+
+    const character = getCharacter(
+      campaign.guildId,
+      turn.userId
+    );
+
+    if (!character || character.hp <= 0) continue;
+
+    combat.defending ||= {};
+    delete combat.defending[turn.userId];
+
+    saveDataSoon();
+
+    await channel.send({
+      content:
+        `🎯 **${character.name}, it's your turn!**\n` +
+        `Describe what you do in normal chat. You can coordinate with the party in voice chat first.`,
+      allowedMentions: { parse: [] },
+    });
+
+    return;
+  }
+}
+
+async function continueCombatTurns(campaign, party, channel) {
+  const combat = campaign.combat;
+  if (!combat?.active) return;
+
+  let safety = 0;
+
+  while (combat.active && safety++ < 30) {
+    const turn = currentCombatant(campaign);
+    if (!turn) return;
+
+    if (turn.type === "player") {
+      const character = getCharacter(
+        campaign.guildId,
+        turn.userId
+      );
+
+      if (!character || character.hp <= 0) {
+        await advanceCombatTurn(campaign, party, channel);
+        return;
+      }
+
+      await channel.send({
+        embeds: [combatStatusEmbed(campaign, party)],
+      });
+
+      await channel.send({
+        content:
+          `🎯 **${character.name}, you're first!** Describe your combat action in normal chat.`,
+        allowedMentions: { parse: [] },
+      });
+
+      return;
+    }
+
+    const enemy = combat.enemies.find(
+      (item) => item.id === turn.enemyId
+    );
+
+    if (enemy && !enemy.defeated && enemy.hp > 0) {
+      await runEnemyTurn(campaign, party, channel, enemy);
+    }
+
+    if (!combat.active) return;
+
+    await advanceCombatTurn(campaign, party, channel);
+    return;
+  }
+}
+
+async function resolveCombatAttackAfterRoll({
+  interaction,
+  campaign,
+  party,
+  character,
+  pending,
+  naturalRoll,
+  outcome,
+}) {
+  const combat = campaign.combat;
+
+  if (!combat?.active) {
+    return interaction.followUp(
+      "⚠️ The attack roll resolved, but the combat encounter is no longer active."
+    );
+  }
+
+  const enemy = combat.enemies.find(
+    (item) => item.id === pending.combatTargetId
+  );
+
+  if (!enemy || enemy.defeated || enemy.hp <= 0) {
+    await interaction.followUp(
+      "⚠️ That target was already defeated. Your turn will advance."
+    );
+    await advanceCombatTurn(
+      campaign,
+      party,
+      interaction.channel
+    );
+    return;
+  }
+
+  if (outcome === "SUCCESS") {
+    const damageExpression =
+      naturalRoll === 20
+        ? doubleDamageDice(
+            pending.combatDamageDice || "1d6"
+          )
+        : pending.combatDamageDice || "1d6";
+
+    const damageRoll = rollDice(damageExpression);
+    const damage = Math.max(
+      1,
+      damageRoll?.total || 1
+    );
+
+    enemy.hp = Math.max(0, enemy.hp - damage);
+
+    if (enemy.hp <= 0) {
+      enemy.defeated = true;
+    }
+
+    saveDataSoon();
+
+    await interaction.followUp({
+      content:
+        `💥 **${character.name} hits ${enemy.name}!**\n` +
+        `${naturalRoll === 20 ? "🌟 **CRITICAL HIT!**\n" : ""}` +
+        `Damage: **${damage}** (${damageExpression})\n` +
+        `${enemy.name}: **${enemy.hp}/${enemy.maxHp} HP**` +
+        (enemy.defeated ? `\n☠️ **${enemy.name} is defeated!**` : ""),
+      allowedMentions: { parse: [] },
+    });
+  } else {
+    await interaction.followUp(
+      `💨 **${character.name}'s attack misses ${enemy.name}.**`
+    );
+  }
+
+  if (!livingEnemies(campaign).length) {
+    await endCombatVictory(
+      campaign,
+      party,
+      interaction.channel
+    );
+    return;
+  }
+
+  await advanceCombatTurn(
+    campaign,
+    party,
+    interaction.channel
+  );
+}
+
+async function endCombatVictory(campaign, party, channel) {
+  const combat = campaign.combat;
+  if (!combat?.active) return;
+
+  combat.active = false;
+  combat.endedAt = Date.now();
+  combat.result = "victory";
+
+  const totalXP = combat.enemies.reduce(
+    (sum, enemy) => sum + Number(enemy.xpValue || 0),
+    0
+  );
+
+  const perCharacterXP = Math.max(
+    10,
+    Math.floor(totalXP / Math.max(1, party.memberIds.length))
+  );
+
+  const levelUps = [];
+
+  for (const userId of party.memberIds) {
+    const character = getCharacter(campaign.guildId, userId);
+    if (!character) continue;
+
+    const progression = awardCharacterXP(
+      character,
+      perCharacterXP,
+      `Combat victory: ${combat.threatName}`
+    );
+
+    if (progression.levelUps.length) {
+      levelUps.push({ character, progression });
+    }
+  }
+
+  normalizeCampaignPacing(campaign);
+  campaign.pacing.actionBeats = 0;
+  campaign.pacing.downtimeActive = true;
+  campaign.pacing.lastDowntimeAt = Date.now();
+
+  appendLog(campaign, {
+    type: "system",
+    text: `Combat ended in victory against ${combat.threatName}.`,
+  });
+
+  saveDataSoon();
+
+  await channel.send({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("🏆 Combat Victory!")
+        .setDescription(
+          `The final enemy falls. Each party member earns **${perCharacterXP} XP**.\n\n` +
+          "The immediate danger is over."
+        ),
+    ],
+  });
+
+  for (const item of levelUps) {
+    await channel.send({
+      embeds: [levelUpEmbed(item.character, item.progression)],
+    });
+  }
+
+  await sendDowntimeBanner(
+    channel,
+    campaign,
+    "Adrenaline fades. Weapons lower. For once, nobody is attacking."
+  );
+
+  resumePartyWindowAfterRoll(campaign);
+}
+
+async function endCombatDefeat(campaign, party, channel) {
+  const combat = campaign.combat;
+  if (!combat?.active) return;
+
+  combat.active = false;
+  combat.endedAt = Date.now();
+  combat.result = "defeat";
+
+  normalizeCampaignPacing(campaign);
+  campaign.pacing.actionBeats = 0;
+  campaign.pacing.downtimeActive = true;
+
+  appendLog(campaign, {
+    type: "system",
+    text:
+      "The entire party was downed in combat. The campaign continues; character death was not applied automatically.",
+  });
+
+  saveDataSoon();
+
+  await channel.send({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("💀 The Party Is Down")
+        .setDescription(
+          "Every adventurer has been reduced to 0 HP.\n\n" +
+          "**Combat v1 does not automatically kill player characters.** " +
+          "The DM can continue with capture, rescue, awakening after the battle, or another story consequence."
+        ),
+    ],
+  });
+
+  await sendDowntimeBanner(
+    channel,
+    campaign,
+    "Consciousness eventually returns—or help arrives. The story is not over."
+  );
 }
 
 // ============================================================
@@ -1060,12 +2240,16 @@ function getPartyByCode(guildId, code) {
 }
 
 function getActiveCampaignForChannel(guildId, channelId) {
-  return Object.values(data.campaigns).find(
-    (c) =>
-      c.guildId === guildId &&
-      c.channelId === channelId &&
-      c.status === "active"
-  );
+  const campaign =
+    Object.values(data.campaigns).find(
+      (c) =>
+        c.guildId === guildId &&
+        c.channelId === channelId &&
+        c.status === "active"
+    ) || null;
+
+  if (campaign) normalizeCampaignPacing(campaign);
+  return campaign;
 }
 
 function getCampaignForParty(partyId) {
@@ -1626,6 +2810,26 @@ RULES:
 - Weave player goals, fears, quirks, backgrounds, and secrets into the campaign gradually.
 - Keep content appropriate for a general Discord gaming server.
 
+
+PACING / DOWNTIME:
+- Do NOT run the campaign as nonstop danger, reveals, and urgent objectives.
+- After roughly 3 substantial action beats, if there is no immediate unresolved danger, deliberately create a downtime/social beat.
+- Downtime can be a campfire, inn, meal, watch shift, safe room, journey pause, morning after a rest, shopping period, quiet travel, or simply a moment after danger.
+- During downtime, explicitly give the player characters room to talk to one another. Do not fill every silence with NPC dialogue.
+- Do not immediately interrupt downtime with a new attack, alarm, explosion, prophecy, chase, or quest hook.
+- If the party chooses to sleep and the location is reasonably safe, let them sleep.
+- If downtimeActive is true in the supplied pacing state, preserve the calm scene until the players clearly choose to leave it or seek danger.
+- Use scene_mode "downtime" when you intentionally create or preserve such a scene.
+
+COMBAT:
+- You may start combat only when hostilities genuinely break out.
+- To start combat, return action_type "combat_start".
+- For combat_start, supply a concise enemy name, enemy archetype, and count.
+- Enemy archetypes: minion, skirmisher, brute, caster, boss.
+- The APPLICATION CODE owns enemy AC, HP, initiative, attacks, damage, player HP, and turn order.
+- Do not narrate numerical combat outcomes that the code has not resolved.
+- When combat is active, the dedicated combat engine handles turns.
+
 CINEMATIC IMAGE RULES:
 - Most DM responses MUST use image_type "none".
 - Request an automatic image only for a truly memorable visual beat: a major new location reveal, first reveal of an important NPC, boss or major monster reveal, major discovery, or chapter-scale cinematic moment.
@@ -1638,7 +2842,7 @@ const dmActionSchema = {
   additionalProperties: false,
   properties: {
     narration: { type: "string" },
-    action_type: { type: "string", enum: ["none", "check"] },
+    action_type: { type: "string", enum: ["none", "check", "combat_start"] },
     player_id: { type: "string" },
     check_name: {
       type: "string",
@@ -1681,6 +2885,16 @@ const dmActionSchema = {
     roll_reason: { type: "string" },
     consequences_success: { type: "string" },
     consequences_failure: { type: "string" },
+    scene_mode: {
+      type: "string",
+      enum: ["action", "downtime", "social", "travel", "combat"],
+    },
+    combat_enemy_name: { type: "string" },
+    combat_enemy_archetype: {
+      type: "string",
+      enum: ["none", "minion", "skirmisher", "brute", "caster", "boss"],
+    },
+    combat_enemy_count: { type: "integer", minimum: 0, maximum: 6 },
     image_type: {
       type: "string",
       enum: ["none", "location", "npc", "monster", "discovery", "cinematic"],
@@ -1697,6 +2911,10 @@ const dmActionSchema = {
     "roll_reason",
     "consequences_success",
     "consequences_failure",
+    "scene_mode",
+    "combat_enemy_name",
+    "combat_enemy_archetype",
+    "combat_enemy_count",
     "image_type",
     "image_prompt",
   ],
@@ -1715,6 +2933,10 @@ async function aiDMAction(campaign, party, actingUserId, playerText) {
       roll_reason: "",
       consequences_success: "",
       consequences_failure: "",
+      scene_mode: "action",
+      combat_enemy_name: "",
+      combat_enemy_archetype: "none",
+      combat_enemy_count: 0,
       image_type: "none",
       image_prompt: "",
     };
@@ -1768,13 +2990,17 @@ const narrationImageSchema = {
   additionalProperties: false,
   properties: {
     narration: { type: "string" },
+    scene_mode: {
+      type: "string",
+      enum: ["action", "downtime", "social", "travel", "combat"],
+    },
     image_type: {
       type: "string",
       enum: ["none", "location", "npc", "monster", "discovery", "cinematic"],
     },
     image_prompt: { type: "string" },
   },
-  required: ["narration", "image_type", "image_prompt"],
+  required: ["narration", "scene_mode", "image_type", "image_prompt"],
 };
 
 async function aiOpening(campaign, party) {
@@ -1865,6 +3091,7 @@ async function aiResolveCheck(campaign, party, rollRecord, pending) {
         rollRecord.outcome === "SUCCESS"
           ? "The attempt succeeds."
           : "The attempt fails, and the situation becomes more complicated.",
+      scene_mode: "action",
       image_type: "none",
       image_prompt: "",
     };
@@ -1879,6 +3106,7 @@ async function aiResolveCheck(campaign, party, rollRecord, pending) {
       },
       party: partyMembersContext(party),
       recentHistory: recentCampaignContext(campaign),
+      pacing: campaignPacingContext(campaign),
       resolvedCheck: {
         characterName: rollRecord.characterName,
         checkName: rollRecord.checkName,
@@ -1892,7 +3120,10 @@ async function aiResolveCheck(campaign, party, rollRecord, pending) {
         failureDirection: pending.failureDirection,
       },
       request:
-        "Narrate the resolved result. Respect the exact success/failure outcome. Do not request another check in this response. Advance the fiction and give the party something to respond to. Only request an image if this resolved check causes a genuinely major reveal.",
+        "Narrate the resolved result. Respect the exact success/failure outcome. Do not request another check in this response. " +
+        "If pacing.downtimeStronglyDue is true and immediate danger has ended, transition into genuine downtime instead of creating another urgent problem. " +
+        "If pacing.downtimeActive is already true, preserve the calm unless this check clearly ends it. " +
+        "Only request an image if this resolved check causes a genuinely major reveal.",
     },
     null,
     2
@@ -2525,6 +3756,15 @@ async function handleAdventureCommand(interaction) {
       summary: "The adventure has just begun.",
       pendingChecks: {},
       autoImagesUsed: 0,
+      pacing: {
+        actionBeats: 0,
+        downtimeActive: false,
+        lastDowntimeAt: 0,
+        lastCombatAt: 0,
+      },
+      combat: {
+        active: false,
+      },
       log: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -2573,6 +3813,8 @@ async function handleAdventureCommand(interaction) {
     campaign.channelId = interaction.channelId;
     campaign.status = "active";
     campaign.pendingChecks ||= {};
+    normalizeCampaignPacing(campaign);
+    campaign.combat ||= { active: false };
     saveDataSoon();
 
     await interaction.deferReply();
@@ -2887,9 +4129,11 @@ async function handleRollCommand(interaction) {
   appendLog(campaign, rollRecord);
 
   const xpAmount =
-    outcome === "SUCCESS"
-      ? 10 + (naturalRoll === 20 ? 5 : 0)
-      : 0;
+    pending.noCheckXP
+      ? 0
+      : outcome === "SUCCESS"
+        ? 10 + (naturalRoll === 20 ? 5 : 0)
+        : 0;
 
   const xpProgression = awardCharacterXP(
     character,
@@ -2929,6 +4173,19 @@ async function handleRollCommand(interaction) {
     });
   }
 
+  if (pending.combatAttack) {
+    await resolveCombatAttackAfterRoll({
+      interaction,
+      campaign,
+      party,
+      character,
+      pending,
+      naturalRoll,
+      outcome,
+    });
+    return;
+  }
+
   try {
     const resolved = await aiResolveCheck(campaign, party, rollRecord, pending);
     appendLog(campaign, { type: "dm", text: resolved.narration });
@@ -2943,6 +4200,19 @@ async function handleRollCommand(interaction) {
       party,
       resolved
     );
+
+    recordScenePacing(
+      campaign,
+      resolved.scene_mode || "action"
+    );
+
+    if (resolved.scene_mode === "downtime") {
+      await sendDowntimeBanner(
+        interaction.channel,
+        campaign,
+        "That moment of tension passes, leaving the party some breathing room."
+      );
+    }
   } catch (err) {
     console.error("Resolve-check narration error:", err);
     await interaction.followUp(
@@ -3295,6 +4565,27 @@ const commands = [
     .setDescription("Mark your current party action as ready for the DM."),
 
   new SlashCommandBuilder()
+    .setName("rest")
+    .setDescription("Take a short or long rest during safe downtime.")
+    .addStringOption((o) =>
+      o
+        .setName("type")
+        .setDescription("Rest type")
+        .setRequired(true)
+        .addChoices(
+          { name: "🔥 Short Rest", value: "short" },
+          { name: "🌙 Long Rest", value: "long" }
+        )
+    ),
+
+  new SlashCommandBuilder()
+    .setName("combat")
+    .setDescription("View the current combat encounter.")
+    .addSubcommand((s) =>
+      s.setName("status").setDescription("Show combatants, HP, and current turn.")
+    ),
+
+  new SlashCommandBuilder()
     .setName("level")
     .setDescription("View your level, XP, and progression."),
 
@@ -3406,6 +4697,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "ready":
           return handleReadyCommand(interaction);
 
+        case "rest":
+          return handleRestCommand(interaction);
+
+        case "combat":
+          return handleCombatStatus(interaction);
+
         case "level":
           return handleLevelCommand(interaction);
 
@@ -3434,11 +4731,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   "**4.** Party leader uses `/adventure start`.\n" +
                   "**5.** Talk normally in the adventure channel. The DM waits **20 seconds after the latest party message** so friends can declare actions together.\n" +
                   "**6.** `/ready` marks your current action ready. If every participating player is ready, the DM responds immediately.\n" +
-                  "**7.** When the DM requests a check, **`/roll` is the reliable roll command**. The 3D Dice button remains experimental.\n" +
-                  "**8.** `/character`, `/inventory`, `/recap`, and `/adventure status` show saved information.\n" +
-                  "**9.** `/level` shows your XP and level progression.\n" +
-                  "**10.** `/askdm question:<your question>` privately asks the DM something without advancing the game.\n" +
-                  "**11.** `/scene` generates the current cinematic scene and `/portrait` creates your character art.\n\n" +
+                  "**7.** When the DM requests a check or combat attack, **`/roll` is the reliable roll command**. The 3D Dice button remains experimental.\n" +
+                  "**8.** Combat uses initiative. On your turn, describe your action normally; enemies take turns automatically. `/combat status` shows the encounter.\n" +
+                  "**9.** The DM now creates downtime after stretches of action. Use `/rest short` or `/rest long` when the party is safe.\n" +
+                  "**10.** `/character`, `/inventory`, `/recap`, and `/adventure status` show saved information.\n" +
+                  "**11.** `/level` shows your XP and level progression.\n" +
+                  "**12.** `/askdm question:<your question>` privately asks the DM something without advancing the game.\n" +
+                  "**13.** `/scene` generates the current cinematic scene and `/portrait` creates your character art.\n\n" +
                   "🎲 You can also roll manual dice with `/roll dice:2d6+3`.\n" +
                   `🖼️ Automatic cinematic images are limited to ${AUTO_IMAGE_LIMIT} per campaign.`
                 ),
@@ -3606,9 +4905,11 @@ async function resolvePhysicalD20({
   appendLog(campaign, rollRecord);
 
   const xpAmount =
-    outcome === "SUCCESS"
-      ? 10 + (naturalRoll === 20 ? 5 : 0)
-      : 0;
+    pending.noCheckXP
+      ? 0
+      : outcome === "SUCCESS"
+        ? 10 + (naturalRoll === 20 ? 5 : 0)
+        : 0;
 
   const xpProgression = awardCharacterXP(
     character,
@@ -3804,6 +5105,10 @@ client.on(Events.MessageCreate, async (message) => {
   const text = cleanPlayerText(message.content);
   if (!text) return;
 
+  if (campaign.combat?.active) {
+    return processCombatPlayerMessage(message, campaign, party);
+  }
+
   // A player with their own unresolved check must resolve that check before
   // declaring another uncertain action. /roll always remains available.
   if (campaign.pendingChecks?.[message.author.id]) {
@@ -3830,6 +5135,8 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`AI configured: ${openai ? "YES" : "NO"}`);
   console.log(`3D dice bridge configured: ${DICE_BRIDGE_SECRET ? "YES" : "NO"}`);
   console.log(`Multiplayer action window: ${PARTY_ACTION_WINDOW_MS / 1000}s`);
+  console.log(`Downtime target: after ${DOWNTIME_AFTER_ACTION_BEATS} action beats when safe`);
+  console.log("Turn-based Combat v1: ENABLED");
 });
 
 process.on("SIGINT", () => {
