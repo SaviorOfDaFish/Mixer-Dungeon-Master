@@ -4497,12 +4497,32 @@ async function handleCharacterBackstoryModal(interaction) {
     });
   }
 
-  const key = sessionKey(
+  // Character creation sessions are channel-scoped in v2.0:
+  // guildId + channelId + userId.
+  //
+  // The original modal handler still used the old guildId + userId key,
+  // which made the session appear to expire at the backstory step.
+  let key = sessionKey(
     interaction.guildId,
+    interaction.channelId,
     interaction.user.id
   );
 
-  const draft = creationSessions.get(key);
+  let draft = creationSessions.get(key);
+
+  // Defensive fallback: if Discord ever gives the modal a slightly different
+  // channel context, locate this user's one active creation draft in the guild.
+  if (!draft) {
+    const possibleSessions = [...creationSessions.entries()].filter(
+      ([, candidate]) =>
+        candidate?.guildId === interaction.guildId &&
+        candidate?.userId === interaction.user.id
+    );
+
+    if (possibleSessions.length === 1) {
+      [key, draft] = possibleSessions[0];
+    }
+  }
 
   if (!draft) {
     return interaction.reply({
@@ -4519,6 +4539,10 @@ async function handleCharacterBackstoryModal(interaction) {
         "⚠️ Finish the earlier character-creation steps first.",
     });
   }
+
+  console.log(
+    `[Character Creation] Backstory modal accepted: user=${interaction.user.id} channel=${interaction.channelId} mode=${mode}`
+  );
 
   if (mode === "custom") {
     draft.backstoryMode = "custom";
