@@ -542,7 +542,7 @@ function schedulePartyWindow(campaign, party, channel) {
 }
 
 function addActionToPartyWindow(message, campaign, party) {
-  const character = getCharacter(message.guildId, message.author.id);
+  const character = getCharacter(message.guildId, message.author.id, message.channelId);
   if (!character) return null;
 
   const text = cleanPlayerText(message.content);
@@ -577,7 +577,7 @@ function readyStatusDescription(windowState, campaign, party) {
   }
 
   const lines = participants.map((userId) => {
-    const character = getCharacter(campaign.guildId, userId);
+    const character = getCharacter(campaign.guildId, userId, campaign.channelId);
     const label = character?.name || `<@${userId}>`;
     return `${windowState.ready.has(userId) ? "✅" : "⏳"} **${label}**`;
   });
@@ -601,7 +601,7 @@ function readyStatusDescription(windowState, campaign, party) {
 }
 
 async function handleReadyCommand(interaction) {
-  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const party = getPartyByMember(interaction.guildId, interaction.user.id, interaction.channelId);
 
   if (!party) {
     return interaction.reply({
@@ -824,7 +824,8 @@ async function processPartyActionWindow(campaignId) {
     ) {
       const targetCharacter = getCharacter(
         campaign.guildId,
-        result.player_id
+        result.player_id,
+        campaign.channelId
       );
 
       if (targetCharacter) {
@@ -1015,7 +1016,7 @@ async function sendDowntimeBanner(channel, campaign, reason = "") {
 }
 
 async function handleRestCommand(interaction) {
-  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const party = getPartyByMember(interaction.guildId, interaction.user.id, interaction.channelId);
 
   if (!party) {
     return interaction.reply({
@@ -1056,7 +1057,7 @@ async function handleRestCommand(interaction) {
   const results = [];
 
   for (const memberId of party.memberIds) {
-    const character = getCharacter(interaction.guildId, memberId);
+    const character = getCharacter(interaction.guildId, memberId, interaction.channelId);
     if (!character) continue;
 
     const before = character.hp;
@@ -1176,7 +1177,7 @@ const ENEMY_ARCHETYPES = {
 
 function averagePartyLevel(party, guildId) {
   const levels = party.memberIds
-    .map((id) => getCharacter(guildId, id)?.level || 1)
+    .map((id) => getCharacter(guildId, id, resolvePartyChannel(party))?.level || 1)
     .filter(Boolean);
 
   if (!levels.length) return 1;
@@ -1222,7 +1223,11 @@ function combatantLabel(campaign, combatant) {
   if (!combatant) return "Unknown";
 
   if (combatant.type === "player") {
-    return getCharacter(campaign.guildId, combatant.userId)?.name || "Adventurer";
+    return getCharacter(
+      campaign.guildId,
+      combatant.userId,
+      campaign.channelId
+    )?.name || "Adventurer";
   }
 
   const enemy = campaign.combat?.enemies?.find(
@@ -1244,7 +1249,7 @@ function livingEnemies(campaign) {
 
 function consciousPartyMembers(campaign, party) {
   return party.memberIds
-    .map((id) => ({ id, character: getCharacter(campaign.guildId, id) }))
+    .map((id) => ({ id, character: getCharacter(campaign.guildId, id, campaign.channelId) }))
     .filter(({ character }) => character && character.hp > 0);
 }
 
@@ -1294,7 +1299,7 @@ function combatStatusEmbed(campaign, party) {
   const current = currentCombatant(campaign);
 
   const partyLines = party.memberIds.map((userId) => {
-    const character = getCharacter(campaign.guildId, userId);
+    const character = getCharacter(campaign.guildId, userId, campaign.channelId);
     if (!character) return `❔ Unknown adventurer`;
 
     const position = getCombatPosition(campaign, userId, character);
@@ -1321,7 +1326,7 @@ function combatStatusEmbed(campaign, party) {
 }
 
 async function handleCombatStatus(interaction) {
-  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const party = getPartyByMember(interaction.guildId, interaction.user.id, interaction.channelId);
   const campaign = party
     ? getActiveCampaignForChannel(interaction.guildId, interaction.channelId)
     : null;
@@ -1366,7 +1371,7 @@ async function startCombatFromDM(campaign, party, channel, result) {
   const initiative = [];
 
   for (const userId of party.memberIds) {
-    const character = getCharacter(campaign.guildId, userId);
+    const character = getCharacter(campaign.guildId, userId, campaign.channelId);
     if (!character || character.hp <= 0) continue;
 
     const roll = 1 + Math.floor(Math.random() * 20);
@@ -1396,7 +1401,7 @@ async function startCombatFromDM(campaign, party, channel, result) {
   const positions = {};
   const threat = {};
   for (const userId of party.memberIds) {
-    const character = getCharacter(campaign.guildId, userId);
+    const character = getCharacter(campaign.guildId, userId, campaign.channelId);
     if (!character) continue;
     positions[userId] = defaultCombatPosition(character);
     threat[userId] = 0;
@@ -1574,7 +1579,7 @@ async function processCombatPlayerMessage(message, campaign, party) {
   if (!combat?.active) return;
 
   if (pendingRollCount(campaign) > 0) {
-    const character = getCharacter(message.guildId, message.author.id);
+    const character = getCharacter(message.guildId, message.author.id, message.channelId);
 
     if (campaign.pendingChecks?.[message.author.id]) {
       await message.reply(
@@ -1598,7 +1603,7 @@ async function processCombatPlayerMessage(message, campaign, party) {
     return;
   }
 
-  const character = getCharacter(message.guildId, message.author.id);
+  const character = getCharacter(message.guildId, message.author.id, message.channelId);
   if (!character || character.hp <= 0) {
     await advanceCombatTurn(campaign, party, message.channel);
     return;
@@ -1846,7 +1851,8 @@ async function advanceCombatTurn(campaign, party, channel) {
 
     const character = getCharacter(
       campaign.guildId,
-      turn.userId
+      turn.userId,
+      campaign.channelId
     );
 
     if (!character || character.hp <= 0) continue;
@@ -1883,7 +1889,8 @@ async function continueCombatTurns(campaign, party, channel) {
     if (turn.type === "player") {
       const character = getCharacter(
         campaign.guildId,
-        turn.userId
+        turn.userId,
+        campaign.channelId
       );
 
       if (!character || character.hp <= 0) {
@@ -2127,7 +2134,7 @@ async function endCombatVictory(campaign, party, channel) {
   const levelUps = [];
 
   for (const userId of party.memberIds) {
-    const character = getCharacter(campaign.guildId, userId);
+    const character = getCharacter(campaign.guildId, userId, campaign.channelId);
     if (!character) continue;
 
     const progression = awardCharacterXP(
@@ -2337,7 +2344,7 @@ function findPartyCharacterByName(party, guildId, targetText) {
   const wanted = String(targetText || "").trim().toLowerCase();
   if (!wanted) return null;
   return party.memberIds
-    .map((userId) => ({ userId, character: getCharacter(guildId, userId) }))
+    .map((userId) => ({ userId, character: getCharacter(guildId, userId, resolvePartyChannel(party)) }))
     .filter((x) => x.character)
     .find((x) => x.character.name.toLowerCase() === wanted || x.character.name.toLowerCase().includes(wanted)) || null;
 }
@@ -2438,7 +2445,7 @@ function applyCombatDamageBonuses(campaign, party, character, pending, enemy, ba
   if (effects.sneakAttackArmed && effects.sneakAttackUsedRound !== campaign.combat.round) {
     const allyFrontline = party.memberIds.some((id) => {
       if (id === character.userId) return false;
-      const ally = getCharacter(campaign.guildId, id);
+      const ally = getCharacter(campaign.guildId, id, campaign.channelId);
       return ally && ally.hp > 0 && getCombatPosition(campaign, id, ally) === "frontline";
     });
     if (pending.rollMode === "advantage" || allyFrontline) {
@@ -2455,7 +2462,7 @@ function applyCombatDamageBonuses(campaign, party, character, pending, enemy, ba
 }
 
 async function handleAbilitiesCommand(interaction) {
-  const character = getCharacter(interaction.guildId, interaction.user.id);
+  const character = getCharacter(interaction.guildId, interaction.user.id, interaction.channelId);
   if (!character) return interaction.reply({ ephemeral: true, content: "Create a character first with `/createcharacter`." });
   normalizeAbilityState(character);
   const lines = (character.abilities || []).map((name) => {
@@ -2469,10 +2476,10 @@ async function handleAbilitiesCommand(interaction) {
 }
 
 async function handlePositionCommand(interaction) {
-  const character = getCharacter(interaction.guildId, interaction.user.id);
+  const character = getCharacter(interaction.guildId, interaction.user.id, interaction.channelId);
   if (!character) return interaction.reply({ ephemeral: true, content: "Create a character first." });
   const position = interaction.options.getString("position", true);
-  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const party = getPartyByMember(interaction.guildId, interaction.user.id, interaction.channelId);
   const campaign = party ? getActiveCampaignForChannel(interaction.guildId, interaction.channelId) : null;
 
   if (!campaign?.combat?.active) {
@@ -2498,7 +2505,7 @@ async function handlePositionCommand(interaction) {
 }
 
 async function handleUseAbilityCommand(interaction) {
-  const character = getCharacter(interaction.guildId, interaction.user.id);
+  const character = getCharacter(interaction.guildId, interaction.user.id, interaction.channelId);
   if (!character) return interaction.reply({ ephemeral: true, content: "Create a character first." });
 
   const requested = interaction.options.getString("ability", true).trim();
@@ -2511,7 +2518,7 @@ async function handleUseAbilityCommand(interaction) {
     return interaction.reply({ ephemeral: true, content: `ℹ️ **${ability}** is passive. ${def?.description || ""}` });
   }
 
-  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const party = getPartyByMember(interaction.guildId, interaction.user.id, interaction.channelId);
   const campaign = party ? getActiveCampaignForChannel(interaction.guildId, interaction.channelId) : null;
   const combat = campaign?.combat?.active ? campaign.combat : null;
 
@@ -2758,32 +2765,252 @@ function statsForClass(className, style) {
   return { ...classData.stats };
 }
 
-function getCharacter(guildId, userId) {
-  const character = data.characters[`${guildId}:${userId}`] || null;
-  if (character) {
-    normalizeCharacterProgression(character);
-    normalizeAbilityState(character);
-    character.preferredCombatPosition ||= defaultCombatPosition(character);
-  }
+function characterStorageKey(guildId, channelId, userId) {
+  return `${guildId}:${channelId}:${userId}`;
+}
+
+function legacyCharacterStorageKey(guildId, userId) {
+  return `${guildId}:${userId}`;
+}
+
+function normalizeLoadedCharacter(character, channelId = "") {
+  if (!character) return null;
+
+  normalizeCharacterProgression(character);
+  normalizeAbilityState(character);
+  character.preferredCombatPosition ||= defaultCombatPosition(character);
+
+  if (channelId) character.channelId = channelId;
   return character;
 }
 
-function setCharacter(guildId, userId, character) {
-  data.characters[`${guildId}:${userId}`] = character;
+function inferLegacyCharacterChannel(guildId, userId) {
+  const parties = Object.values(data.parties).filter(
+    (party) =>
+      party.guildId === guildId &&
+      party.memberIds?.includes(userId)
+  );
+
+  const campaigns = Object.values(data.campaigns)
+    .filter(
+      (campaign) =>
+        campaign.guildId === guildId &&
+        parties.some((party) => party.id === campaign.partyId) &&
+        campaign.channelId
+    )
+    .sort(
+      (a, b) =>
+        Number(b.updatedAt || b.createdAt || 0) -
+        Number(a.updatedAt || a.createdAt || 0)
+    );
+
+  return campaigns[0]?.channelId || "";
+}
+
+function getCharacter(guildId, userId, channelId = "") {
+  if (channelId) {
+    const scopedKey = characterStorageKey(
+      guildId,
+      channelId,
+      userId
+    );
+
+    const scoped = data.characters[scopedKey] || null;
+    if (scoped) {
+      return normalizeLoadedCharacter(scoped, channelId);
+    }
+
+    const legacyKey = legacyCharacterStorageKey(guildId, userId);
+    const legacy = data.characters[legacyKey] || null;
+
+    if (legacy) {
+      const inferredChannel =
+        legacy.channelId ||
+        inferLegacyCharacterChannel(guildId, userId);
+
+      if (
+        inferredChannel &&
+        inferredChannel !== channelId
+      ) {
+        return null;
+      }
+
+      legacy.channelId = channelId;
+      data.characters[scopedKey] = legacy;
+      delete data.characters[legacyKey];
+      saveDataSoon();
+
+      return normalizeLoadedCharacter(legacy, channelId);
+    }
+
+    return null;
+  }
+
+  const matches = Object.values(data.characters).filter(
+    (character) =>
+      character?.guildId === guildId &&
+      character?.userId === userId
+  );
+
+  if (matches.length === 1) {
+    return normalizeLoadedCharacter(
+      matches[0],
+      matches[0].channelId || ""
+    );
+  }
+
+  const legacy =
+    data.characters[
+      legacyCharacterStorageKey(guildId, userId)
+    ] || null;
+
+  return legacy
+    ? normalizeLoadedCharacter(legacy, legacy.channelId || "")
+    : null;
+}
+
+function setCharacter(
+  guildId,
+  userId,
+  channelId,
+  character
+) {
+  if (
+    character === undefined &&
+    channelId &&
+    typeof channelId === "object"
+  ) {
+    character = channelId;
+    channelId = character.channelId || "";
+  }
+
+  if (!channelId) {
+    throw new Error(
+      "setCharacter requires a Discord channelId."
+    );
+  }
+
+  character.guildId = guildId;
+  character.userId = userId;
+  character.channelId = channelId;
+
+  data.characters[
+    characterStorageKey(guildId, channelId, userId)
+  ] = character;
+
   saveDataSoon();
 }
 
-function getPartyByMember(guildId, userId) {
-  return Object.values(data.parties).find(
-    (p) => p.guildId === guildId && p.memberIds.includes(userId)
-  );
+function resolvePartyChannel(party) {
+  if (!party) return "";
+  if (party.channelId) return party.channelId;
+
+  const campaign = Object.values(data.campaigns)
+    .filter(
+      (item) =>
+        item.partyId === party.id &&
+        item.channelId
+    )
+    .sort(
+      (a, b) =>
+        Number(b.updatedAt || b.createdAt || 0) -
+        Number(a.updatedAt || a.createdAt || 0)
+    )[0];
+
+  if (campaign?.channelId) {
+    party.channelId = campaign.channelId;
+    saveDataSoon();
+  }
+
+  return party.channelId || "";
 }
 
-function getPartyByCode(guildId, code) {
-  const upper = String(code || "").toUpperCase();
-  return Object.values(data.parties).find(
-    (p) => p.guildId === guildId && p.code === upper
+function getPartyByMember(
+  guildId,
+  userId,
+  channelId = ""
+) {
+  const matches = Object.values(data.parties).filter(
+    (party) =>
+      party.guildId === guildId &&
+      party.memberIds?.includes(userId)
   );
+
+  if (channelId) {
+    const exact =
+      matches.find(
+        (party) =>
+          resolvePartyChannel(party) === channelId
+      ) || null;
+
+    if (exact) return exact;
+
+    // Legacy parties created before channel binding can be adopted by the
+    // first channel where their existing member uses them.
+    const unassigned = matches.filter(
+      (party) => !resolvePartyChannel(party)
+    );
+
+    if (unassigned.length === 1) {
+      unassigned[0].channelId = channelId;
+      saveDataSoon();
+      return unassigned[0];
+    }
+
+    return null;
+  }
+
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function getPartyByCode(
+  guildId,
+  code,
+  channelId = ""
+) {
+  const upper = String(code || "").toUpperCase();
+
+  const matches = Object.values(data.parties).filter(
+    (party) =>
+      party.guildId === guildId &&
+      party.code === upper
+  );
+
+  if (!channelId) return matches[0] || null;
+
+  const exact =
+    matches.find(
+      (party) =>
+        resolvePartyChannel(party) === channelId
+    ) || null;
+
+  if (exact) return exact;
+
+  const unassigned = matches.filter(
+    (party) => !resolvePartyChannel(party)
+  );
+
+  if (unassigned.length === 1) {
+    unassigned[0].channelId = channelId;
+    saveDataSoon();
+    return unassigned[0];
+  }
+
+  return null;
+}
+
+function getCharactersForUser(guildId, userId) {
+  return Object.values(data.characters)
+    .filter(
+      (character) =>
+        character?.guildId === guildId &&
+        character?.userId === userId
+    )
+    .sort(
+      (a, b) =>
+        Number(b.updatedAt || b.createdAt || 0) -
+        Number(a.updatedAt || a.createdAt || 0)
+    );
 }
 
 function getActiveCampaignForChannel(guildId, channelId) {
@@ -2967,7 +3194,7 @@ async function sendLong(channel, text, options = {}) {
 function partyMembersContext(party) {
   return party.memberIds
     .map((userId) => {
-      const c = getCharacter(party.guildId, userId);
+      const c = getCharacter(party.guildId, userId, resolvePartyChannel(party));
       if (!c) return null;
       return {
         userId,
@@ -3039,7 +3266,7 @@ function formatCooldown(ms) {
 function visualPartyContext(party) {
   return party.memberIds
     .map((userId) => {
-      const c = getCharacter(party.guildId, userId);
+      const c = getCharacter(party.guildId, userId, resolvePartyChannel(party));
       if (!c) return null;
       return `${c.name}: ${c.ancestry} ${c.className}; appearance: ${c.appearance}; equipment: ${c.inventory.slice(0, 5).join(", ")}`;
     })
@@ -3179,7 +3406,7 @@ async function maybeSendAutomaticImage(channel, campaign, party, imageData) {
 }
 
 async function handleSceneCommand(interaction) {
-  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const party = getPartyByMember(interaction.guildId, interaction.user.id, interaction.channelId);
   if (!party) {
     return interaction.reply({
       ephemeral: true,
@@ -3252,7 +3479,7 @@ async function handleSceneCommand(interaction) {
 }
 
 async function handlePortraitCommand(interaction) {
-  const character = getCharacter(interaction.guildId, interaction.user.id);
+  const character = getCharacter(interaction.guildId, interaction.user.id, interaction.channelId);
 
   if (!character) {
     return interaction.reply({
@@ -3585,7 +3812,7 @@ async function aiDMAction(campaign, party, actingUserId, playerText) {
   }
 
   const characters = partyMembersContext(party);
-  const actingCharacter = getCharacter(campaign.guildId, actingUserId);
+  const actingCharacter = getCharacter(campaign.guildId, actingUserId, campaign.channelId);
 
   const input = JSON.stringify(
     {
@@ -3899,8 +4126,8 @@ RULES:
 
 const creationSessions = new Map();
 
-function sessionKey(guildId, userId) {
-  return `${guildId}:${userId}`;
+function sessionKey(guildId, channelId, userId) {
+  return `${guildId}:${channelId}:${userId}`;
 }
 
 function createClassMenu(userId) {
@@ -4061,7 +4288,7 @@ function createAIBackstoryIdeaModal(userId) {
 }
 
 async function startCharacterCreation(interaction) {
-  const existing = getCharacter(interaction.guildId, interaction.user.id);
+  const existing = getCharacter(interaction.guildId, interaction.user.id, interaction.channelId);
 
   const modal = new ModalBuilder()
     .setCustomId(`cc_details:${interaction.user.id}`)
@@ -4119,6 +4346,7 @@ async function handleCharacterDetails(interaction) {
 
   const draft = {
     guildId: interaction.guildId,
+    channelId: interaction.channelId,
     userId: interaction.user.id,
     name: interaction.fields.getTextInputValue("name").trim(),
     appearance: interaction.fields.getTextInputValue("appearance").trim(),
@@ -4134,7 +4362,7 @@ async function handleCharacterDetails(interaction) {
     backstoryText: "",
   };
 
-  creationSessions.set(sessionKey(interaction.guildId, interaction.user.id), draft);
+  creationSessions.set(sessionKey(interaction.guildId, interaction.channelId, interaction.user.id), draft);
 
   await interaction.reply({
     ephemeral: true,
@@ -4163,6 +4391,7 @@ async function finalizeCharacterCreation(interaction, draft, key) {
     const character = {
       id: uid(),
       guildId: interaction.guildId,
+      channelId: interaction.channelId,
       userId: interaction.user.id,
       name: draft.name,
       ancestry: draft.ancestry,
@@ -4199,6 +4428,7 @@ async function finalizeCharacterCreation(interaction, draft, key) {
     setCharacter(
       interaction.guildId,
       interaction.user.id,
+      interaction.channelId,
       character
     );
 
@@ -4325,7 +4555,7 @@ async function handleCharacterSelect(interaction) {
     });
   }
 
-  const key = sessionKey(interaction.guildId, interaction.user.id);
+  const key = sessionKey(interaction.guildId, interaction.channelId, interaction.user.id);
   const draft = creationSessions.get(key);
 
   if (!draft) {
@@ -4463,7 +4693,7 @@ async function handleCharacterSelect(interaction) {
 function partyEmbed(party) {
   const members = party.memberIds
     .map((id) => {
-      const c = getCharacter(party.guildId, id);
+      const c = getCharacter(party.guildId, id, resolvePartyChannel(party));
       const leader = id === party.leaderId ? " 👑" : "";
       return c ? `${c.name} — Lv.${c.level} ${c.className}${leader}` : `<@${id}>${leader}`;
     })
@@ -4485,7 +4715,7 @@ async function handlePartyCommand(interaction) {
   const userId = interaction.user.id;
 
   if (sub === "create") {
-    const character = getCharacter(guildId, userId);
+    const character = getCharacter(guildId, userId, interaction.channelId);
     if (!character) {
       return interaction.reply({
         ephemeral: true,
@@ -4493,7 +4723,7 @@ async function handlePartyCommand(interaction) {
       });
     }
 
-    if (getPartyByMember(guildId, userId)) {
+    if (getPartyByMember(guildId, userId, interaction.channelId)) {
       return interaction.reply({
         ephemeral: true,
         content: "You're already in a party. Leave it before creating another.",
@@ -4503,6 +4733,7 @@ async function handlePartyCommand(interaction) {
     const party = {
       id: uid(),
       guildId,
+      channelId: interaction.channelId,
       code: partyCode(),
       name: interaction.options.getString("name") || `${character.name}'s Party`,
       leaderId: userId,
@@ -4519,7 +4750,7 @@ async function handlePartyCommand(interaction) {
   }
 
   if (sub === "join") {
-    const character = getCharacter(guildId, userId);
+    const character = getCharacter(guildId, userId, interaction.channelId);
     if (!character) {
       return interaction.reply({
         ephemeral: true,
@@ -4527,7 +4758,7 @@ async function handlePartyCommand(interaction) {
       });
     }
 
-    if (getPartyByMember(guildId, userId)) {
+    if (getPartyByMember(guildId, userId, interaction.channelId)) {
       return interaction.reply({
         ephemeral: true,
         content: "You're already in a party.",
@@ -4535,7 +4766,7 @@ async function handlePartyCommand(interaction) {
     }
 
     const code = interaction.options.getString("code");
-    const party = getPartyByCode(guildId, code);
+    const party = getPartyByCode(guildId, code, interaction.channelId);
 
     if (!party) {
       return interaction.reply({
@@ -4561,7 +4792,7 @@ async function handlePartyCommand(interaction) {
   }
 
   if (sub === "leave") {
-    const party = getPartyByMember(guildId, userId);
+    const party = getPartyByMember(guildId, userId, interaction.channelId);
     if (!party) {
       return interaction.reply({
         ephemeral: true,
@@ -4593,7 +4824,7 @@ async function handlePartyCommand(interaction) {
   }
 
   if (sub === "status") {
-    const party = getPartyByMember(guildId, userId);
+    const party = getPartyByMember(guildId, userId, interaction.channelId);
     if (!party) {
       return interaction.reply({
         ephemeral: true,
@@ -4645,7 +4876,7 @@ async function handleAdventureCommand(interaction) {
   const sub = interaction.options.getSubcommand();
   const guildId = interaction.guildId;
   const userId = interaction.user.id;
-  const party = getPartyByMember(guildId, userId);
+  const party = getPartyByMember(guildId, userId, interaction.channelId);
 
   if (!party) {
     return interaction.reply({
@@ -4662,6 +4893,7 @@ async function handleAdventureCommand(interaction) {
   }
 
   if (sub === "start") {
+    party.channelId = interaction.channelId;
     const existing = getCampaignForParty(party.id);
     if (existing?.status === "active") {
       return interaction.reply({
@@ -4738,7 +4970,15 @@ async function handleAdventureCommand(interaction) {
       });
     }
 
-    campaign.channelId = interaction.channelId;
+    if (campaign.channelId !== interaction.channelId) {
+      return interaction.reply({
+        ephemeral: true,
+        content:
+          `This saved adventure belongs to <#${campaign.channelId}>. ` +
+          "Use `/adventure continue` in that channel so each campaign keeps its own character roster.",
+      });
+    }
+
     campaign.status = "active";
     campaign.pendingChecks ||= {};
     normalizeCampaignPacing(campaign);
@@ -4787,7 +5027,7 @@ async function handleAdventureCommand(interaction) {
 
     const completionResults = party.memberIds
       .map((memberId) => {
-        const memberCharacter = getCharacter(guildId, memberId);
+        const memberCharacter = getCharacter(guildId, memberId, campaign.channelId);
         if (!memberCharacter) return null;
 
         return {
@@ -4852,7 +5092,7 @@ async function handleAdventureCommand(interaction) {
 }
 
 async function processPlayerAction(message, campaign, party) {
-  const character = getCharacter(message.guildId, message.author.id);
+  const character = getCharacter(message.guildId, message.author.id, message.channelId);
   if (!character) return;
 
   const text = cleanPlayerText(message.content);
@@ -4970,7 +5210,7 @@ async function processPlayerAction(message, campaign, party) {
 async function handleRollCommand(interaction) {
   const guildId = interaction.guildId;
   const userId = interaction.user.id;
-  const character = getCharacter(guildId, userId);
+  const character = getCharacter(guildId, userId, interaction.channelId);
 
   if (!character) {
     return interaction.reply({
@@ -4980,7 +5220,7 @@ async function handleRollCommand(interaction) {
   }
 
   const customDice = interaction.options.getString("dice");
-  const party = getPartyByMember(guildId, userId);
+  const party = getPartyByMember(guildId, userId, interaction.channelId);
 
   // IMPORTANT: locate the campaign that ACTUALLY owns this player's pending
   // check instead of simply grabbing the most recently updated campaign.
@@ -5174,7 +5414,7 @@ async function handleRollCommand(interaction) {
 // ============================================================
 
 async function handleLevelCommand(interaction) {
-  const character = getCharacter(interaction.guildId, interaction.user.id);
+  const character = getCharacter(interaction.guildId, interaction.user.id, interaction.channelId);
 
   if (!character) {
     return interaction.reply({
@@ -5333,8 +5573,8 @@ async function handleAskDMCommand(interaction) {
     });
   }
 
-  const character = getCharacter(interaction.guildId, interaction.user.id);
-  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const character = getCharacter(interaction.guildId, interaction.user.id, interaction.channelId);
+  const party = getPartyByMember(interaction.guildId, interaction.user.id, interaction.channelId);
   const campaign = party ? getCampaignForParty(party.id) : null;
 
   await interaction.deferReply({ ephemeral: true });
@@ -5371,7 +5611,7 @@ async function handleAskDMCommand(interaction) {
 // ============================================================
 
 async function handleRecap(interaction) {
-  const party = getPartyByMember(interaction.guildId, interaction.user.id);
+  const party = getPartyByMember(interaction.guildId, interaction.user.id, interaction.channelId);
 
   if (!party) {
     return interaction.reply({
@@ -5422,6 +5662,10 @@ const commands = [
         .setDescription("Whose character to view")
         .setRequired(false)
     ),
+
+  new SlashCommandBuilder()
+    .setName("characters")
+    .setDescription("List all of your channel-specific characters in this server."),
 
   new SlashCommandBuilder()
     .setName("inventory")
@@ -5621,9 +5865,50 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "createcharacter":
           return startCharacterCreation(interaction);
 
+        case "characters": {
+          const characters = getCharactersForUser(
+            interaction.guildId,
+            interaction.user.id
+          );
+
+          if (!characters.length) {
+            return interaction.reply({
+              ephemeral: true,
+              content:
+                "You don't have any characters yet. Use `/createcharacter` in the channel where you want to play.",
+            });
+          }
+
+          const description = characters
+            .map((character) => {
+              const channelText = character.channelId
+                ? `<#${character.channelId}>`
+                : "Legacy / unassigned channel";
+
+              return (
+                `**${character.name}** — Lv.${character.level} ${character.ancestry} ${character.className}\n` +
+                `${channelText}`
+              );
+            })
+            .join("\n\n");
+
+          return interaction.reply({
+            ephemeral: true,
+            embeds: [
+              new EmbedBuilder()
+                .setTitle("🧙 Your Characters")
+                .setDescription(description)
+                .setFooter({
+                  text:
+                    "Each Discord channel has its own character slot.",
+                }),
+            ],
+          });
+        }
+
         case "character": {
           const target = interaction.options.getUser("player") || interaction.user;
-          const character = getCharacter(interaction.guildId, target.id);
+          const character = getCharacter(interaction.guildId, target.id, interaction.channelId);
 
           if (!character) {
             return interaction.reply({
@@ -5641,7 +5926,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         case "inventory": {
-          const character = getCharacter(interaction.guildId, interaction.user.id);
+          const character = getCharacter(interaction.guildId, interaction.user.id, interaction.channelId);
           if (!character) {
             return interaction.reply({
               ephemeral: true,
@@ -5703,7 +5988,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               new EmbedBuilder()
                 .setTitle("🐉 AI Dungeon Master — Quick Start")
                 .setDescription(
-                  "**1.** `/createcharacter` — Build your adventurer, including your own backstory or an AI-written one from your idea.\n" +
+                  "**1.** `/createcharacter` — Build the adventurer for THIS channel. You can have a different character in every D&D channel. Use `/characters` to see them all.\n" +
                   "**2.** `/party create` — Make a party and share its code.\n" +
                   "**3.** Friends use `/party join`.\n" +
                   "**4.** Party leader uses `/adventure start`.\n" +
@@ -5729,7 +6014,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interaction.customId.startsWith("launch_3d_dice:")
     ) {
       const pendingId = interaction.customId.split(":")[1];
-      const party = getPartyByMember(interaction.guildId, interaction.user.id);
+      const party = getPartyByMember(interaction.guildId, interaction.user.id, interaction.channelId);
 
       if (!party) {
         return interaction.reply({
@@ -5820,84 +6105,74 @@ function findBridgePending(
   userId,
   expectedPendingId = ""
 ) {
-  const character = getCharacter(guildId, userId);
-  if (!character) return { error: "NO_CHARACTER" };
-
-  const party = getPartyByMember(guildId, userId);
-  if (!party) return { error: "NO_PARTY" };
-
-  // IMPORTANT:
-  // Discord Activities may run inside a VOICE channel even though the
-  // adventure itself is in a TEXT channel. Therefore activityChannelId
-  // cannot be treated as the authoritative campaign channel.
-  //
-  // First collect every active campaign in this guild/party that has a
-  // pending roll for this exact Discord user.
   const candidates = Object.values(data.campaigns)
-    .filter(
-      (campaign) =>
-        campaign.guildId === guildId &&
-        campaign.partyId === party.id &&
-        campaign.status === "active" &&
-        campaign.pendingChecks?.[userId]
-    )
+    .filter((campaign) => {
+      if (
+        campaign.guildId !== guildId ||
+        campaign.status !== "active" ||
+        !campaign.pendingChecks?.[userId]
+      ) {
+        return false;
+      }
+
+      const party = data.parties[campaign.partyId];
+      return Boolean(
+        party &&
+        party.memberIds?.includes(userId)
+      );
+    })
     .map((campaign) => ({
       campaign,
+      party: data.parties[campaign.partyId],
       pending: campaign.pendingChecks[userId],
-    }));
+      character: getCharacter(
+        guildId,
+        userId,
+        campaign.channelId
+      ),
+    }))
+    .filter((item) => item.character);
 
   if (!candidates.length) {
     return { error: "NO_PENDING_ROLL" };
   }
 
-  // If the Activity already knows the unique roll ID, that is the strongest
-  // possible match and prevents an old/stale roll from being submitted.
   if (expectedPendingId) {
-    const exactPending = candidates.find(
-      ({ pending }) => pending.id === expectedPendingId
+    const exact = candidates.find(
+      ({ pending }) =>
+        pending.id === expectedPendingId
     );
 
-    if (!exactPending) {
+    if (!exact) {
       return { error: "PENDING_ROLL_CHANGED" };
     }
 
     return {
-      character,
-      party,
-      campaign: exactPending.campaign,
-      pending: exactPending.pending,
+      ...exact,
       activityChannelId,
     };
   }
 
-  // Prefer the text campaign channel if Discord happens to report it.
   const exactChannel = candidates.find(
-    ({ campaign }) => campaign.channelId === activityChannelId
+    ({ campaign }) =>
+      campaign.channelId === activityChannelId
   );
 
   if (exactChannel) {
     return {
-      character,
-      party,
-      campaign: exactChannel.campaign,
-      pending: exactChannel.pending,
+      ...exactChannel,
       activityChannelId,
     };
   }
 
-  // Otherwise choose the newest pending roll for this player. This is the
-  // normal multiplayer/voice-chat case.
   candidates.sort(
     (a, b) =>
-      Number(b.pending.createdAt || 0) -
-      Number(a.pending.createdAt || 0)
+      Number(b.campaign.updatedAt || 0) -
+      Number(a.campaign.updatedAt || 0)
   );
 
   return {
-    character,
-    party,
-    campaign: candidates[0].campaign,
-    pending: candidates[0].pending,
+    ...candidates[0],
     activityChannelId,
   };
 }
@@ -6212,7 +6487,11 @@ client.on(Events.MessageCreate, async (message) => {
   if (!party) return;
   if (!party.memberIds.includes(message.author.id)) return;
 
-  const character = getCharacter(message.guildId, message.author.id);
+  const character = getCharacter(
+    message.guildId,
+    message.author.id,
+    campaign.channelId
+  );
   if (!character) return;
 
   // Out-of-character chat: completely ignored by the adventure engine.
