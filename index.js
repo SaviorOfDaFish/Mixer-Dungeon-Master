@@ -522,6 +522,21 @@ function schedulePartyWindow(campaign, party, channel) {
     return;
   }
 
+  // SOLO PARTY:
+  // The 20-second batching delay only exists to give multiple players time
+  // to type and coordinate. A one-player party should feel conversational,
+  // so resolve their action immediately.
+  if ((party?.memberIds?.length || 0) <= 1) {
+    windowState.timer = setTimeout(() => {
+      processPartyActionWindow(campaign.id).catch((err) =>
+        console.error("Solo party immediate processing error:", err)
+      );
+    }, 50);
+
+    windowState.deadline = Date.now() + 50;
+    return;
+  }
+
   if (everyoneInWindowReady(windowState)) {
     windowState.timer = setTimeout(() => {
       processPartyActionWindow(campaign.id).catch((err) =>
@@ -586,6 +601,11 @@ function readyStatusDescription(windowState, campaign, party) {
     lines.push(
       "",
       `🎲 The DM is waiting for **${pendingRollCount(campaign)} unresolved roll${pendingRollCount(campaign) === 1 ? "" : "s"}** before continuing.`
+    );
+  } else if ((party?.memberIds?.length || 0) <= 1) {
+    lines.push(
+      "",
+      "⚡ **Solo party — the DM responds immediately.**"
     );
   } else {
     const remaining = partyWindowRemainingSeconds(windowState);
@@ -6016,7 +6036,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   "**2.** `/party create` — Make a party and share its code.\n" +
                   "**3.** Friends use `/party join`.\n" +
                   "**4.** Party leader uses `/adventure start`.\n" +
-                  "**5.** Talk normally in the adventure channel. The DM waits **20 seconds after the latest party message** so friends can declare actions together.\n" +
+                  "**5.** Talk normally in the adventure channel. **Solo parties get an immediate DM response.** Multiplayer parties wait **20 seconds after the latest party message** so friends can declare actions together.\n" +
                   "**6.** `/ready` marks your current action ready. If every participating player is ready, the DM responds immediately.\n" +
                   "**7.** When the DM requests a check or combat attack, **`/roll` is the reliable roll command**. The 3D Dice button remains experimental.\n" +
                   "**8.** Combat uses initiative. On your turn, describe your action normally; enemies take turns automatically. `/combat status` shows the encounter.\n" +
@@ -6554,6 +6574,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`AI configured: ${openai ? "YES" : "NO"}`);
   console.log(`3D dice bridge configured: ${DICE_BRIDGE_SECRET ? "YES" : "NO"}`);
   console.log(`Multiplayer action window: ${PARTY_ACTION_WINDOW_MS / 1000}s`);
+  console.log("Solo party response delay: IMMEDIATE");
   console.log(`Downtime target: after ${DOWNTIME_AFTER_ACTION_BEATS} action beats when safe`);
   console.log("Turn-based Combat v1: ENABLED");
   console.log("Character backstory choice: PLAYER-WRITTEN or AI-GENERATED");
