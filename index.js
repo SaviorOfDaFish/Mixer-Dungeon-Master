@@ -41,6 +41,8 @@ const AUTO_IMAGE_LIMIT = 3;
 const SCENE_COOLDOWN_MS = 10 * 60 * 1000;
 const PORTRAIT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const DICE_BRIDGE_SECRET = process.env.DICE_BRIDGE_SECRET || "";
+const DICE_ADMIN_PASSWORD = process.env.DICE_ADMIN_PASSWORD || "";
+const DICE_ADMIN_SESSION_MS = 30 * 60 * 1000;
 const HTTP_PORT = Number(process.env.PORT || 3000);
 const PARTY_ACTION_WINDOW_MS = 20 * 1000;
 const DOWNTIME_AFTER_ACTION_BEATS = 3;
@@ -6143,6 +6145,54 @@ function bridgeAuthorized(req) {
   return supplied.length > 0 && supplied === DICE_BRIDGE_SECRET;
 }
 
+// Admin Test Mode sessions are intentionally separate from the bridge secret.
+// Set DICE_ADMIN_PASSWORD in Railway; never ship the password to browser JS.
+const diceAdminSessions = new Map();
+const diceAdminAttempts = new Map();
+
+function safePasswordEqual(a, b) {
+  const left = Buffer.from(String(a || ""));
+  const right = Buffer.from(String(b || ""));
+  if (left.length !== right.length || !left.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function adminClientKey(req) {
+  return String(req.headers["x-forwarded-for"] || req.ip || "unknown")
+    .split(",")[0]
+    .trim();
+}
+
+function adminRateLimited(req) {
+  const key = adminClientKey(req);
+  const now = Date.now();
+  const row = diceAdminAttempts.get(key) || { count: 0, resetAt: now + 60_000 };
+  if (now >= row.resetAt) {
+    row.count = 0;
+    row.resetAt = now + 60_000;
+  }
+  row.count += 1;
+  diceAdminAttempts.set(key, row);
+  return row.count > 8;
+}
+
+function issueDiceAdminToken() {
+  const token = crypto.randomBytes(32).toString("hex");
+  diceAdminSessions.set(token, Date.now() + DICE_ADMIN_SESSION_MS);
+  return token;
+}
+
+function diceAdminAuthorized(req) {
+  const auth = String(req.headers.authorization || "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  const expiresAt = token ? diceAdminSessions.get(token) : 0;
+  if (!expiresAt || expiresAt <= Date.now()) {
+    if (token) diceAdminSessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
 function findBridgePending(
   guildId,
   activityChannelId,
@@ -6417,7 +6467,45 @@ bridgeApp.get("/health", (_req, res) => {
     ok: true,
     service: "mixer-dungeon-master",
     diceBridgeConfigured: Boolean(DICE_BRIDGE_SECRET),
+    diceAdminConfigured: Boolean(DICE_ADMIN_PASSWORD),
   });
+});
+
+bridgeApp.post("/dice/admin/login", (req, res) => {
+  if (!DICE_ADMIN_PASSWORD) {
+    return res.status(503).json({ ok: false, error: "ADMIN_NOT_CONFIGURED" });
+  }
+
+  if (adminRateLimited(req)) {
+    return res.status(429).json({ ok: false, error: "TOO_MANY_ATTEMPTS" });
+  }
+
+  const password = String(req.body?.password || "");
+  if (!safePasswordEqual(password, DICE_ADMIN_PASSWORD)) {
+    return res.status(401).json({ ok: false, error: "INVALID_PASSWORD" });
+  }
+
+  const token = issueDiceAdminToken();
+  return res.json({
+    ok: true,
+    token,
+    expiresInMs: DICE_ADMIN_SESSION_MS,
+    mode: "admin_test",
+  });
+});
+
+bridgeApp.get("/dice/admin/session", (req, res) => {
+  if (!diceAdminAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: "ADMIN_SESSION_REQUIRED" });
+  }
+  return res.json({ ok: true, mode: "admin_test" });
+});
+
+bridgeApp.post("/dice/admin/logout", (req, res) => {
+  const auth = String(req.headers.authorization || "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (token) diceAdminSessions.delete(token);
+  return res.json({ ok: true });
 });
 
 bridgeApp.post("/dice/pending", (req, res) => {
@@ -6508,6 +6596,17 @@ bridgeApp.post("/dice/result", async (req, res) => {
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
 });
+
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, expiresAt] of diceAdminSessions) {
+    if (expiresAt <= now) diceAdminSessions.delete(token);
+  }
+  for (const [key, row] of diceAdminAttempts) {
+    if (row.resetAt <= now) diceAdminAttempts.delete(key);
+  }
+}, 60_000).unref();
 
 bridgeApp.listen(HTTP_PORT, "0.0.0.0", () => {
   console.log(`3D dice bridge HTTP API listening on port ${HTTP_PORT}`);
